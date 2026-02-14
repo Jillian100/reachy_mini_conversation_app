@@ -45,9 +45,17 @@ def run(
     # Putting these dependencies here makes the dashboard faster to load when the conversation app is installed
     from reachy_mini_conversation_app.moves import MovementManager
     from reachy_mini_conversation_app.console import LocalStream
-    from reachy_mini_conversation_app.openai_realtime import OpenaiRealtimeHandler
     from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
     from reachy_mini_conversation_app.audio.head_wobbler import HeadWobbler
+
+    # Backend selection: "openai" (default), "gemini", or "claude"
+    conversation_backend = os.environ.get("CONVERSATION_BACKEND", "openai").lower()
+    if conversation_backend == "gemini":
+        from reachy_mini_conversation_app.gemini_live_handler import GeminiLiveHandler as ConversationHandler
+    elif conversation_backend == "claude":
+        from reachy_mini_conversation_app.claude_pipeline_handler import ClaudePipelineHandler as ConversationHandler
+    else:
+        from reachy_mini_conversation_app.openai_realtime import OpenaiRealtimeHandler as ConversationHandler
 
     logger = setup_logger(args.debug)
     logger.info("Starting Reachy Mini Conversation App")
@@ -126,7 +134,8 @@ def run(
     )
     logger.debug(f"Chatbot avatar images: {chatbot.avatar_images}")
 
-    handler = OpenaiRealtimeHandler(deps, gradio_mode=args.gradio, instance_path=instance_path)
+    handler = ConversationHandler(deps, gradio_mode=args.gradio, instance_path=instance_path)
+    logger.info("Using conversation backend: %s (%s)", conversation_backend, ConversationHandler.__name__)
 
     stream_manager: gr.Blocks | LocalStream | None = None
 

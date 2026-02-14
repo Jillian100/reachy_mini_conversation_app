@@ -14,7 +14,7 @@ import sys
 import time
 import asyncio
 import logging
-from typing import List, Optional
+from typing import Any, List, Optional
 from pathlib import Path
 
 from fastrtc import AdditionalOutputs, audio_to_float32
@@ -23,7 +23,6 @@ from scipy.signal import resample
 from reachy_mini import ReachyMini
 from reachy_mini.media.media_manager import MediaBackend
 from reachy_mini_conversation_app.config import LOCKED_PROFILE, config
-from reachy_mini_conversation_app.openai_realtime import OpenaiRealtimeHandler
 from reachy_mini_conversation_app.headless_personality_ui import mount_personality_routes
 
 
@@ -49,7 +48,7 @@ class LocalStream:
 
     def __init__(
         self,
-        handler: OpenaiRealtimeHandler,
+        handler: Any,
         robot: ReachyMini,
         *,
         settings_app: Optional[FastAPI] = None,
@@ -340,34 +339,42 @@ class LocalStream:
             except Exception:
                 pass  # Instance .env loading is optional; continue with defaults
 
-        # If key is still missing, try to download one from HuggingFace
-        if not (config.OPENAI_API_KEY and str(config.OPENAI_API_KEY).strip()):
-            logger.info("OPENAI_API_KEY not set, attempting to download from HuggingFace...")
-            try:
-                from gradio_client import Client
-                client = Client("HuggingFaceM4/gradium_setup", verbose=False)
-                key, status = client.predict(api_name="/claim_b_key")
-                if key and key.strip():
-                    logger.info("Successfully downloaded API key from HuggingFace")
-                    # Persist it immediately
-                    self._persist_api_key(key)
-            except Exception as e:
-                logger.warning(f"Failed to download API key from HuggingFace: {e}")
+        # Determine which backend we're using
+        _backend = os.environ.get("CONVERSATION_BACKEND", "openai").lower()
+        _is_gemini = _backend == "gemini"
+
+        if _is_gemini:
+            # Gemini mode: check for GEMINI_API_KEY or GOOGLE_API_KEY
+            _gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
+            if not _gemini_key.strip():
+                logger.error("GEMINI_API_KEY or GOOGLE_API_KEY not found. Set it in environment or .env")
+        else:
+            # OpenAI mode: original API key flow
+            if not (config.OPENAI_API_KEY and str(config.OPENAI_API_KEY).strip()):
+                logger.info("OPENAI_API_KEY not set, attempting to download from HuggingFace...")
+                try:
+                    from gradio_client import Client
+                    client = Client("HuggingFaceM4/gradium_setup", verbose=False)
+                    key, status = client.predict(api_name="/claim_b_key")
+                    if key and key.strip():
+                        logger.info("Successfully downloaded API key from HuggingFace")
+                        self._persist_api_key(key)
+                except Exception as e:
+                    logger.warning(f"Failed to download API key from HuggingFace: {e}")
 
         # Always expose settings UI if a settings app is available
-        # (do this AFTER loading/downloading the key so status endpoint sees the right value)
         self._init_settings_ui_if_needed()
 
-        # If key is still missing -> wait until provided via the settings UI
-        if not (config.OPENAI_API_KEY and str(config.OPENAI_API_KEY).strip()):
-            logger.warning("OPENAI_API_KEY not found. Open the app settings page to enter it.")
-            # Poll until the key becomes available (set via the settings UI)
-            try:
-                while not (config.OPENAI_API_KEY and str(config.OPENAI_API_KEY).strip()):
-                    time.sleep(0.2)
-            except KeyboardInterrupt:
-                logger.info("Interrupted while waiting for API key.")
-                return
+        if not _is_gemini:
+            # OpenAI mode: wait for key if missing
+            if not (config.OPENAI_API_KEY and str(config.OPENAI_API_KEY).strip()):
+                logger.warning("OPENAI_API_KEY not found. Open the app settings page to enter it.")
+                try:
+                    while not (config.OPENAI_API_KEY and str(config.OPENAI_API_KEY).strip()):
+                        time.sleep(0.2)
+                except KeyboardInterrupt:
+                    logger.info("Interrupted while waiting for API key.")
+                    return
 
         # Start media after key is set/available
         self._robot.media.start_recording()
