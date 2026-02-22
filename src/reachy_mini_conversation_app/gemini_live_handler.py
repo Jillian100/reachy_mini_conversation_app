@@ -254,7 +254,6 @@ class GeminiLiveHandler(AsyncStreamHandler):
             self._reconnect_requested = False
             logger.info("Gemini Live session connected")
 
-            # Run receive loop until session ends or reconnect requested
             try:
                 await self._receive_loop()
             finally:
@@ -537,15 +536,11 @@ class GeminiLiveHandler(AsyncStreamHandler):
 
     async def emit(self) -> Tuple[int, NDArray[np.int16]] | AdditionalOutputs | None:
         """Emit audio/outputs to speaker and chatbot."""
-        # Idle behavior
-        idle_duration = asyncio.get_event_loop().time() - self.last_activity_time
-        if idle_duration > 15.0 and self.deps.movement_manager.is_idle():
-            try:
-                await self.send_idle_signal(idle_duration)
-            except Exception as e:
-                logger.warning("Idle signal failed: %s", e)
-                return None
-            self.last_activity_time = asyncio.get_event_loop().time()
+        # Idle behavior — DISABLED (2026-02-22)
+        # Gemini Live native audio ignores system_instruction idle directives.
+        # send_idle_signal() sends "express yourself" as user message, which
+        # overrides profile instructions and causes unprompted motivational speech.
+        # Fix: stop sending idle signals entirely. Robot stays silent when idle.
 
         return await wait_for_item(self.output_queue)
 
