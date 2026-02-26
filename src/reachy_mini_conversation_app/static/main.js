@@ -30,7 +30,7 @@ async function waitForStatus(timeoutMs = 15000) {
       url.searchParams.set("_", Date.now().toString());
       const resp = await fetchWithTimeout(url, {}, 2000);
       if (resp.ok) return await resp.json();
-    } catch (e) {}
+    } catch (e) { }
     if (Date.now() >= deadline) return null;
     await sleep(500);
   }
@@ -47,7 +47,7 @@ async function waitForPersonalityData(timeoutMs = 15000) {
       url.searchParams.set("_", Date.now().toString());
       const resp = await fetchWithTimeout(url, {}, 2000);
       if (resp.ok) return await resp.json();
-    } catch (e) {}
+    } catch (e) { }
 
     if (loadingText) {
       loadingText.textContent = attempts > 8 ? "Starting backend…" : "Loading…";
@@ -58,7 +58,7 @@ async function waitForPersonalityData(timeoutMs = 15000) {
 }
 
 async function validateKey(key) {
-  const body = { openai_api_key: key };
+  const body = { openai_api_key: key }; // still use this param name for backend compatibility
   const resp = await fetch("/validate_api_key", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -72,8 +72,8 @@ async function validateKey(key) {
 }
 
 async function saveKey(key) {
-  const body = { openai_api_key: key };
-  const resp = await fetch("/openai_api_key", {
+  const body = { openai_api_key: key }; // still use this param name for backend compatibility
+  const resp = await fetch("/api_key", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -129,7 +129,7 @@ async function savePersonality(payload) {
       body: form.toString(),
     }, 5000);
     if (resp.ok) return await resp.json();
-  } catch {}
+  } catch { }
 
   // Fallback to GET (query params)
   try {
@@ -141,7 +141,7 @@ async function savePersonality(payload) {
     url.searchParams.set("_", Date.now().toString());
     resp = await fetchWithTimeout(url, { method: "GET" }, 5000);
     if (resp.ok) return await resp.json();
-  } catch {}
+  } catch { }
 
   const data = await resp.json().catch(() => ({}));
   throw new Error(data.error || "save_failed");
@@ -214,10 +214,21 @@ async function init() {
   show(configuredPanel, false);
   show(personalityPanel, false);
 
-  const st = (await waitForStatus()) || { has_key: false };
+  const st = (await waitForStatus()) || { has_key: false, backend: 'openai' };
+  const backendName = (st.backend || 'openai').charAt(0).toUpperCase() + (st.backend || 'openai').slice(1);
+
+  // Update labels based on backend
+  document.querySelectorAll(".backend-name").forEach(el => el.textContent = backendName);
+  const keyLabel = document.querySelector('label[for="api-key"]');
+  if (keyLabel) keyLabel.textContent = `${backendName} API Key`;
+  const connectH2 = document.querySelector("#form-panel h2");
+  if (connectH2) connectH2.textContent = `Connect ${backendName}`;
+
   if (st.has_key) {
     statusEl.textContent = "";
     show(configuredPanel, true);
+    const configuredMsg = document.querySelector("#configured .muted");
+    if (configuredMsg) configuredMsg.textContent = `${backendName} API key is already configured. You can jump straight to personalities.`;
   }
 
   // Handler for "Change API key" button
@@ -478,7 +489,7 @@ async function init() {
         pStatus.textContent = "Saved.";
         pStatus.className = "status ok";
         // Auto-apply
-        try { await applyPersonality(pSelect.value); } catch {}
+        try { await applyPersonality(pSelect.value); } catch { }
       } catch (e) {
         pStatus.textContent = "Failed to save.";
         pStatus.className = "status error";

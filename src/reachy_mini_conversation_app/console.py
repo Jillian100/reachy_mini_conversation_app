@@ -109,25 +109,30 @@ class LocalStream:
         """Persist API key to environment and instance ``.env`` if possible.
 
         Behavior:
-        - Always sets ``OPENAI_API_KEY`` in process env and in-memory config.
-        - Writes/updates ``<instance_path>/.env``:
-          * If ``.env`` exists, replaces/append OPENAI_API_KEY line.
-          * Else, copies template from ``<instance_path>/.env.example`` when present,
-            otherwise falls back to the packaged template
-            ``reachy_mini_conversation_app/.env.example``.
-          * Ensures the resulting file contains the full template plus the key.
-        - Loads the written ``.env`` into the current process environment.
+        - Sets the appropriate API_KEY in process env and in-memory config based on current backend.
+        - Writes/updates ``<instance_path>/.env``.
         """
         k = (key or "").strip()
         if not k:
             return
+
+        # Determine which key to persist
+        backend = os.environ.get("CONVERSATION_BACKEND", "gemini").lower()
+        if backend == "gemini":
+            key_name = "GEMINI_API_KEY"
+        elif backend == "claude":
+            key_name = "ANTHROPIC_API_KEY"
+        else:
+            key_name = "OPENAI_API_KEY"
+
         # Update live process env and config so consumers see it immediately
         try:
-            os.environ["OPENAI_API_KEY"] = k
+            os.environ[key_name] = k
         except Exception:  # best-effort
             pass
         try:
-            config.OPENAI_API_KEY = k
+            if key_name == "OPENAI_API_KEY":
+                config.OPENAI_API_KEY = k
         except Exception:
             pass
 
@@ -139,15 +144,15 @@ class LocalStream:
             lines = self._read_env_lines(env_path)
             replaced = False
             for i, ln in enumerate(lines):
-                if ln.strip().startswith("OPENAI_API_KEY="):
-                    lines[i] = f"OPENAI_API_KEY={k}"
+                if ln.strip().startswith(f"{key_name}="):
+                    lines[i] = f"{key_name}={k}"
                     replaced = True
                     break
             if not replaced:
-                lines.append(f"OPENAI_API_KEY={k}")
+                lines.append(f"{key_name}={k}")
             final_text = "\n".join(lines) + "\n"
             env_path.write_text(final_text, encoding="utf-8")
-            logger.info("Persisted OPENAI_API_KEY to %s", env_path)
+            logger.info("Persisted %s to %s", key_name, env_path)
 
             # Load the newly written .env into this process to ensure downstream imports see it
             try:
@@ -157,7 +162,7 @@ class LocalStream:
             except Exception:
                 pass
         except Exception as e:
-            logger.warning("Failed to persist OPENAI_API_KEY: %s", e)
+            logger.warning("Failed to persist API Key: %s", e)
 
     def _persist_personality(self, profile: Optional[str]) -> None:
         """Persist the startup personality to the instance .env and config."""
@@ -254,8 +259,14 @@ class LocalStream:
         # GET /status -> whether key is set
         @self._settings_app.get("/status")
         def _status() -> JSONResponse:
-            has_key = bool(config.OPENAI_API_KEY and str(config.OPENAI_API_KEY).strip())
-            return JSONResponse({"has_key": has_key})
+            backend = os.environ.get("CONVERSATION_BACKEND", "gemini").lower()
+            if backend == "gemini":
+                has_key = bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
+            elif backend == "claude":
+                has_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
+            else:
+                has_key = bool(config.OPENAI_API_KEY and str(config.OPENAI_API_KEY).strip())
+            return JSONResponse({"has_key": has_key, "backend": backend})
 
         # GET /ready -> whether backend finished loading tools
         @self._settings_app.get("/ready")
@@ -267,14 +278,19 @@ class LocalStream:
                 ready = False
             return JSONResponse({"ready": ready})
 
-        # POST /openai_api_key -> set/persist key
-        @self._settings_app.post("/openai_api_key")
+        # POST /api_key -> set/persist key (renamed from openai_api_key for generic use)
+        @self._settings_app.post("/api_key")
         def _set_key(payload: ApiKeyPayload) -> JSONResponse:
             key = (payload.openai_api_key or "").strip()
             if not key:
                 return JSONResponse({"ok": False, "error": "empty_key"}, status_code=400)
             self._persist_api_key(key)
             return JSONResponse({"ok": True})
+
+        # Backward compatibility for old UI
+        @self._settings_app.post("/openai_api_key")
+        def _set_key_compat(payload: ApiKeyPayload) -> JSONResponse:
+            return _set_key(payload)
 
         # POST /validate_api_key -> validate key without persisting it
         @self._settings_app.post("/validate_api_key")
@@ -340,8 +356,9 @@ class LocalStream:
                 pass  # Instance .env loading is optional; continue with defaults
 
         # Determine which backend we're using
-        _backend = os.environ.get("CONVERSATION_BACKEND", "openai").lower()
+        _backend = os.environ.get("CONVERSATION_BACKEND", "gemini").lower()
         _is_gemini = _backend == "gemini"
+        _is_claude = _backend == "claude"
 
         if _is_gemini:
             # Gemini mode: check for GEMINI_API_KEY or GOOGLE_API_KEY
@@ -365,7 +382,7 @@ class LocalStream:
         # Always expose settings UI if a settings app is available
         self._init_settings_ui_if_needed()
 
-        if not _is_gemini:
+        if not (_is_gemini or _is_claude):
             # OpenAI mode: wait for key if missing
             if not (config.OPENAI_API_KEY and str(config.OPENAI_API_KEY).strip()):
                 logger.warning("OPENAI_API_KEY not found. Open the app settings page to enter it.")
@@ -374,6 +391,15 @@ class LocalStream:
                         time.sleep(0.2)
                 except KeyboardInterrupt:
                     logger.info("Interrupted while waiting for API key.")
+                    return
+        elif _is_claude:
+            _claude_key = os.environ.get("ANTHROPIC_API_KEY") or ""
+            if not _claude_key.strip():
+                logger.warning("ANTHROPIC_API_KEY not found. Open the app settings page to enter it.")
+                try:
+                    while not (os.environ.get("ANTHROPIC_API_KEY") or "").strip():
+                        time.sleep(0.2)
+                except KeyboardInterrupt:
                     return
 
         # Start media after key is set/available

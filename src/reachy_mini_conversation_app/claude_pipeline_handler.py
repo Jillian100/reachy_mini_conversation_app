@@ -59,6 +59,42 @@ WAKE_WORDS: Final[list[str]] = [w.strip().lower() for w in _WAKE_WORD_RAW.split(
 # Sentence boundary characters for streaming TTS
 SENTENCE_ENDINGS = frozenset("。！？!?\n")
 
+# LLM model routing: complex triggers → Sonnet, otherwise → Haiku
+COMPLEX_TRIGGERS: Final[list[str]] = [
+    "為什麼", "分析", "解釋", "觀音", "市場", "策略",
+    "比一比", "比較一下",  # "比較" alone too ambiguous (比較長 = relatively long)
+    "why", "analyze", "compare", "explain", "strategy",
+]
+MODEL_HAIKU: Final[str] = "claude-haiku-4-5-20251001"
+MODEL_SONNET: Final[str] = "claude-sonnet-4-6-20250514"
+MAX_TOKENS_HAIKU: Final[int] = 400
+MAX_TOKENS_SONNET: Final[int] = 800
+
+# Emotion → TTS speed mapping (CosyVoice speed parameter)
+EMOTION_TTS_SPEED: Final[Dict[str, float]] = {
+    "neutral": 1.0,
+    "happy": 1.1,
+    "excited": 1.15,
+    "curious": 1.0,
+    "thoughtful": 0.9,
+    "concerned": 0.95,
+    "empathetic": 0.9,
+}
+
+# Emotion → head wobbler intensity multiplier
+EMOTION_WOBBLE_INTENSITY: Final[Dict[str, float]] = {
+    "neutral": 1.0,
+    "happy": 1.3,
+    "excited": 1.5,
+    "curious": 1.2,
+    "thoughtful": 0.7,
+    "concerned": 0.8,
+    "empathetic": 0.9,
+}
+
+import re as _re_module
+_EMOTION_PATTERN = _re_module.compile(r"\[emotion:(\w+)\]\s*")
+
 
 def _convert_tools_to_claude(tool_specs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Convert OpenAI-format tool specs to Claude tool format.
@@ -132,7 +168,13 @@ METIS_IDENTITY = """你是 Metis - 五福數位文明系統的官方發言人。
 - 你有工具可以執行實際動作（調音量、跳舞、表情、轉頭等）
 - 當用戶要求動作時，使用對應的 tool 執行，不要只用嘴巴說
 - 回答要簡短，適合語音對話（不是文字聊天）
-- 每次回答控制在 3-5 句話以內"""
+- 每次回答控制在 3-5 句話以內
+
+【情緒標記】
+- 在每次回應的最開頭加上情緒標記：[emotion:neutral]
+- 可用的情緒：neutral, happy, excited, curious, thoughtful, concerned, empathetic
+- 標記會被系統自動移除，不會被語音合成念出來
+- 範例：[emotion:happy] 當然可以！我來幫你查一下。"""
 
 
 class ClaudePipelineHandler(AsyncStreamHandler):
@@ -169,7 +211,21 @@ class ClaudePipelineHandler(AsyncStreamHandler):
         self.claude_model: str = ""
         self.tts_voice: str = ""
 
-        # VAD state: accumulate PCM until silence detected
+        # VAD: try Silero first (lazy-loaded), fallback to energy-based
+        self._silero_vad: Any = None
+        try:
+            from reachy_mini_conversation_app.audio.silero_vad import SileroVAD
+            # SileroVAD is lazy — model loads on first process_chunk(), not here
+            self._silero_vad = SileroVAD(
+                threshold=0.5,
+                min_speech_ms=300,
+                min_silence_ms=700,
+            )
+            logger.info("Silero VAD initialized (model loads on first audio)")
+        except ImportError:
+            logger.info("Silero VAD not importable, using energy-based VAD")
+
+        # Energy-based VAD state (fallback)
         self._audio_buffer = bytearray()
         self._is_speech = False
         self._silence_start: float = 0.0
@@ -181,6 +237,16 @@ class ClaudePipelineHandler(AsyncStreamHandler):
 
         # Pipeline lock: True while STT→Claude→TTS is running
         self._processing = False
+
+        # Barge-in: user interrupts while robot is speaking
+        self._barge_in_event = asyncio.Event()
+
+        # TTS serialization queue: ensures sentences play in order
+        self._tts_queue: asyncio.Queue[tuple[str, float] | None] = asyncio.Queue()
+        self._tts_worker_task: asyncio.Task | None = None
+
+        # Emotion state for TTS modulation
+        self._current_emotion: str = "neutral"
 
         # Conversation history for Claude (keeps recent context)
         self._messages: List[Dict[str, str]] = []
@@ -256,10 +322,27 @@ class ClaudePipelineHandler(AsyncStreamHandler):
             WAKE_WORDS or ["(none)"],
         )
 
+        # Start TTS worker (sequential playback)
+        self._tts_worker_task = asyncio.create_task(self._tts_worker())
+
+        # Load last session summary from HQ (if available)
+        await self._load_session_context()
+
     async def shutdown(self) -> None:
-        """Shutdown the handler."""
+        """Shutdown the handler: save session summary, then clean up."""
         self._shutdown_requested = True
         self._connected_event.clear()
+
+        # Stop TTS worker
+        self._tts_queue.put_nowait(None)
+        if self._tts_worker_task and not self._tts_worker_task.done():
+            try:
+                await asyncio.wait_for(self._tts_worker_task, timeout=3.0)
+            except asyncio.TimeoutError:
+                self._tts_worker_task.cancel()
+
+        # Save session summary to HQ before shutting down
+        await self._save_session_summary()
 
         # Drain output queue
         while not self.output_queue.empty():
@@ -267,6 +350,91 @@ class ClaudePipelineHandler(AsyncStreamHandler):
                 self.output_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+
+    # ------------------------------------------------------------------ #
+    #  Session memory: persist conversation across restarts
+    # ------------------------------------------------------------------ #
+    async def _load_session_context(self) -> None:
+        """Load last session summary from HQ on startup."""
+        hq_url = os.environ.get("HQ_SERVER_URL", "http://192.168.0.98:8097")
+        try:
+            import urllib.request
+            import json as _json
+            req = urllib.request.Request(
+                f"{hq_url}/session_log?agent=amelie&last=1",
+                method="GET",
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = _json.loads(resp.read())
+            summary = data.get("summary", "")
+            if summary:
+                self._messages.append({
+                    "role": "user",
+                    "content": f"[上次對話摘要] {summary}",
+                })
+                self._messages.append({
+                    "role": "assistant",
+                    "content": "好的，我記得上次的對話。",
+                })
+                logger.info("Loaded session context from HQ: %s", summary[:60])
+        except Exception as e:
+            logger.debug("No previous session context (HQ: %s)", e)
+
+    async def _save_session_summary(self) -> None:
+        """Summarize current conversation and POST to HQ for persistence."""
+        if not self._messages or len(self._messages) < 2:
+            return
+
+        hq_url = os.environ.get("HQ_SERVER_URL", "http://192.168.0.98:8097")
+
+        # Build text summary of conversation
+        conv_parts = []
+        for m in self._messages[-20:]:  # Last 20 messages
+            role = m.get("role", "?")
+            content = m.get("content", "")
+            if isinstance(content, str) and content:
+                conv_parts.append(f"{role}: {content[:100]}")
+
+        if not conv_parts:
+            return
+
+        # Summarize with Haiku
+        summary_text = "\n".join(conv_parts)
+        try:
+            if self.claude_client:
+                resp = await self.claude_client.messages.create(
+                    model=MODEL_HAIKU,
+                    max_tokens=150,
+                    system="用繁體中文一段話摘要以下 Amelie 機器人對話，重點記錄用戶的偏好和重要資訊，不超過 80 字。",
+                    messages=[{"role": "user", "content": summary_text}],
+                )
+                summary = resp.content[0].text if resp.content else ""
+            else:
+                summary = summary_text[:200]
+        except Exception as e:
+            logger.warning("Session summarization failed: %s", e)
+            summary = summary_text[:200]
+
+        # POST to HQ
+        try:
+            import urllib.request
+            import json as _json
+            payload = _json.dumps({
+                "agent": "amelie",
+                "summary": summary,
+                "message_count": len(self._messages),
+            }).encode()
+            req = urllib.request.Request(
+                f"{hq_url}/session_log",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                result = _json.loads(resp.read())
+            logger.info("Session summary saved to HQ: %s", summary[:60])
+        except Exception as e:
+            logger.warning("Failed to save session to HQ: %s", e)
 
     # ------------------------------------------------------------------ #
     #  Audio input: receive() — VAD and speech accumulation
@@ -280,12 +448,23 @@ class ClaudePipelineHandler(AsyncStreamHandler):
         if not self._connected_event.is_set():
             return
 
-        # Echo suppression: skip mic input while robot is speaking
+        # Barge-in detection: if robot is speaking and user speaks loudly, interrupt
         if self._model_speaking:
             if _time.time() - self._last_audio_data_time > 3.0:
                 self._model_speaking = False
                 logger.debug("Echo suppression auto-reset (3s timeout)")
             else:
+                # Check for barge-in: user voice energy > threshold × 1.5
+                _, barge_frame = frame
+                if barge_frame.ndim == 2:
+                    barge_frame = barge_frame.ravel()
+                if barge_frame.dtype == np.int16:
+                    barge_f32 = barge_frame.astype(np.float32) / 32768.0
+                else:
+                    barge_f32 = barge_frame.astype(np.float32)
+                barge_rms = float(np.sqrt(np.mean(barge_f32 ** 2)))
+                if barge_rms > SILENCE_THRESHOLD * 1.5:
+                    await self._trigger_barge_in()
                 return
 
         # Skip mic input while pipeline is processing
@@ -309,7 +488,23 @@ class ClaudePipelineHandler(AsyncStreamHandler):
         else:
             audio_f32 = audio_frame.astype(np.float32)
 
-        # Calculate RMS energy for VAD (float32 scale)
+        # ---- Silero VAD path (preferred) ----
+        if self._silero_vad is not None:
+            vad_result = self._silero_vad.process_chunk(audio_f32)
+            if not self._silero_vad.available:
+                # Model failed to load on first chunk — disable and fall through to energy VAD
+                logger.warning("Silero VAD failed to load, switching to energy-based VAD")
+                self._silero_vad = None
+            else:
+                # DoA: look toward sound source on speech start
+                if vad_result.speech_started:
+                    self._look_toward_speaker()
+                if vad_result.speech_ended and vad_result.speech_audio:
+                    logger.warning("Silero VAD: speech ended, launching pipeline...")
+                    asyncio.create_task(self._process_speech(vad_result.speech_audio))
+                return
+
+        # ---- Energy-based VAD fallback ----
         rms = float(np.sqrt(np.mean(audio_f32 ** 2)))
         now = asyncio.get_event_loop().time()
 
@@ -320,6 +515,8 @@ class ClaudePipelineHandler(AsyncStreamHandler):
             # Speech detected
             if not self._is_speech:
                 self._is_speech = True
+                # DoA: look toward sound source on speech start
+                self._look_toward_speaker()
                 self._speech_start = now
                 self._audio_buffer = bytearray()
                 logger.debug("Speech started (RMS=%.4f)", rms)
@@ -352,16 +549,96 @@ class ClaudePipelineHandler(AsyncStreamHandler):
                     self._audio_buffer = bytearray()
 
     # ------------------------------------------------------------------ #
+    #  Emotion: parse [emotion:xxx] tags and adjust TTS/wobbler
+    # ------------------------------------------------------------------ #
+    def _parse_emotion(self, text: str) -> tuple[str, str]:
+        """Parse and strip [emotion:xxx] tag from text.
+
+        Returns:
+            (cleaned_text, emotion_name) tuple.
+        """
+        match = _EMOTION_PATTERN.match(text)
+        if match:
+            emotion = match.group(1).lower()
+            cleaned = text[match.end():]
+            if emotion in EMOTION_TTS_SPEED:
+                self._current_emotion = emotion
+                # Adjust head wobbler intensity if available
+                if self.deps.head_wobbler is not None:
+                    intensity = EMOTION_WOBBLE_INTENSITY.get(emotion, 1.0)
+                    if hasattr(self.deps.head_wobbler, "set_intensity"):
+                        self.deps.head_wobbler.set_intensity(intensity)
+                logger.debug("Emotion detected: %s", emotion)
+                return cleaned, emotion
+        return text, getattr(self, "_current_emotion", "neutral")
+
+    # ------------------------------------------------------------------ #
+    #  DoA: look toward speaker on speech start
+    # ------------------------------------------------------------------ #
+    def _look_toward_speaker(self) -> None:
+        """Get Direction of Arrival from XMOS mic array and turn head toward speaker."""
+        try:
+            doa = self.deps.reachy_mini.media.get_DoA()
+            if doa is not None:
+                asyncio.create_task(
+                    self.deps.movement_manager.look_at_angle(doa)
+                )
+                logger.debug("DoA: turning toward speaker at %d°", doa)
+        except Exception as e:
+            logger.debug("DoA not available: %s", e)
+
+    # ------------------------------------------------------------------ #
+    #  Barge-in: user interrupts robot speech
+    # ------------------------------------------------------------------ #
+    async def _trigger_barge_in(self) -> None:
+        """Interrupt current response: drain queues, reset state, allow new speech."""
+        if self._barge_in_event.is_set():
+            return  # Already triggered
+        logger.warning("Barge-in triggered — interrupting robot speech")
+        self._barge_in_event.set()
+        self._model_speaking = False
+
+        # Drain TTS queue (pending sentences that haven't started playing)
+        while not self._tts_queue.empty():
+            try:
+                self._tts_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+        # Drain output queue (audio chunks already queued for speaker)
+        while not self.output_queue.empty():
+            try:
+                self.output_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+        # Release pipeline lock so receive() can accept new speech immediately
+        self._processing = False
+
+        # Reset head wobbler
+        if self.deps.head_wobbler is not None:
+            self.deps.head_wobbler.reset()
+
+    # ------------------------------------------------------------------ #
     #  Pipeline: STT → Claude → TTS
     # ------------------------------------------------------------------ #
     async def _process_speech(self, pcm_data: bytes) -> None:
         """Full pipeline: Whisper STT → Claude streaming → Edge-TTS → output."""
+        if self._processing:
+            logger.debug("Pipeline already running, skipping")
+            return
         self._processing = True
+        self._barge_in_event.clear()  # Reset barge-in for new utterance
         self.last_activity_time = asyncio.get_event_loop().time()
 
         try:
             # 1. Whisper STT
-            text = await self._transcribe(pcm_data)
+            try:
+                text = await self._transcribe(pcm_data)
+            except Exception as e:
+                logger.error("Whisper STT failed, resetting: %s", e)
+                return  # finally block resets _processing
+
             if not text or len(text.strip()) < 2:
                 logger.warning("Whisper returned empty/short text, skipping")
                 return
@@ -395,15 +672,48 @@ class ClaudePipelineHandler(AsyncStreamHandler):
             )
 
             # 3. Claude response with tool-use + 4. TTS per sentence
-            await self._generate_response(text)
+            try:
+                await self._generate_response(text)
+            except Exception as e:
+                logger.error("Claude response failed: %s", e, exc_info=True)
+                # TTS a brief error message so user knows
+                try:
+                    await self._tts_and_emit("讓我重試一下。")
+                except Exception:
+                    pass
+                # Still save the user message even if response failed
+                if not any(m.get("content") == text for m in self._messages[-3:]):
+                    self._messages.append({"role": "user", "content": text})
 
         except Exception as e:
             logger.error("Pipeline error: %s", e, exc_info=True)
         finally:
             self._processing = False
 
+    @staticmethod
+    def _highpass_filter(pcm_data: bytes, cutoff_hz: int = 200) -> bytes:
+        """Apply high-pass filter to remove robot motor low-frequency noise.
+
+        Args:
+            pcm_data: Raw PCM bytes (16kHz, 16-bit, mono).
+            cutoff_hz: Cutoff frequency in Hz. Default 200Hz.
+
+        Returns:
+            Filtered PCM bytes.
+        """
+        try:
+            from scipy.signal import butter, sosfilt
+            audio = np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32)
+            # 4th order Butterworth high-pass
+            sos = butter(4, cutoff_hz, btype="high", fs=SAMPLE_RATE, output="sos")
+            filtered = sosfilt(sos, audio)
+            return np.clip(filtered, -32768, 32767).astype(np.int16).tobytes()
+        except ImportError:
+            logger.debug("scipy not available, skipping high-pass filter")
+            return pcm_data
+
     async def _transcribe(self, pcm_data: bytes) -> str:
-        """Transcribe PCM audio via OpenAI Whisper API.
+        """Transcribe PCM audio via Whisper API (Groq or OpenAI).
 
         Args:
             pcm_data: Raw PCM bytes (16kHz, 16-bit, mono).
@@ -411,6 +721,9 @@ class ClaudePipelineHandler(AsyncStreamHandler):
         Returns:
             Transcribed text string.
         """
+        # Apply high-pass filter to remove robot motor noise
+        pcm_data = self._highpass_filter(pcm_data)
+
         # Encode PCM as WAV in-memory (Whisper API expects a file-like object)
         wav_buffer = io.BytesIO()
         with wave.open(wav_buffer, "wb") as wf:
@@ -422,27 +735,82 @@ class ClaudePipelineHandler(AsyncStreamHandler):
         wav_buffer.name = "speech.wav"  # Whisper API needs a filename hint
 
         try:
+            # Auto-detect language (supports Chinese-English mixed speech)
             response = await self.whisper_client.audio.transcriptions.create(
                 model=self._whisper_model,
                 file=wav_buffer,
-                language="zh",
             )
             return response.text
         except Exception as e:
             logger.error("Whisper STT failed: %s", e)
             return ""
 
+    def _select_model(self, user_text: str) -> tuple[str, int]:
+        """Select Claude model based on query complexity.
+
+        Returns:
+            (model_id, max_tokens) tuple.
+        """
+        # Short simple queries → Haiku (fast)
+        if len(user_text) < 15 and not any(t in user_text for t in COMPLEX_TRIGGERS):
+            return MODEL_HAIKU, MAX_TOKENS_HAIKU
+        # Complex queries → Sonnet (deep)
+        if any(t in user_text for t in COMPLEX_TRIGGERS):
+            return MODEL_SONNET, MAX_TOKENS_SONNET
+        # Default → configured model
+        return self.claude_model, MAX_TOKENS_HAIKU
+
+    async def _maybe_summarize_history(self) -> None:
+        """If conversation history exceeds 20 messages, summarize oldest 10 with Haiku."""
+        if len(self._messages) <= 20:
+            return
+
+        # Extract first 10 messages for summarization
+        old_messages = self._messages[:10]
+        old_text_parts = []
+        for m in old_messages:
+            role = m.get("role", "?")
+            content = m.get("content", "")
+            if isinstance(content, str):
+                old_text_parts.append(f"{role}: {content[:100]}")
+
+        if not old_text_parts:
+            self._messages = self._messages[-20:]
+            return
+
+        try:
+            summary_resp = await self.claude_client.messages.create(
+                model=MODEL_HAIKU,
+                max_tokens=200,
+                system="你是對話摘要助手。用繁體中文一段話摘要以下對話重點，不超過 100 字。",
+                messages=[{
+                    "role": "user",
+                    "content": "\n".join(old_text_parts),
+                }],
+            )
+            summary_text = summary_resp.content[0].text if summary_resp.content else ""
+            if summary_text:
+                # Replace old messages with a summary message
+                self._messages = [
+                    {"role": "user", "content": f"[對話摘要] {summary_text}"},
+                    {"role": "assistant", "content": "好的，我記住了之前的對話。"},
+                ] + self._messages[10:]
+                logger.info("Summarized %d old messages into context", len(old_messages))
+        except Exception as e:
+            # On failure, just trim
+            logger.warning("History summarization failed: %s, trimming instead", e)
+            self._messages = self._messages[-20:]
+
     async def _generate_response(self, user_text: str) -> None:
-        """Generate Claude response with tool-use (AI Agent), then TTS the text."""
+        """Generate Claude response with streaming + tool-use, TTS at sentence boundaries."""
         self._model_speaking = True
         self._last_audio_data_time = _time.time()
 
         # Append user message to conversation history
         self._messages.append({"role": "user", "content": user_text})
 
-        # Keep conversation history manageable (last 30 messages for tool loops)
-        if len(self._messages) > 30:
-            self._messages = self._messages[-30:]
+        # Rolling summary: summarize old messages when history grows too long
+        await self._maybe_summarize_history()
 
         # Build system prompt: Metis identity + profile instructions if available
         system_prompt = METIS_IDENTITY
@@ -464,71 +832,163 @@ class ClaudePipelineHandler(AsyncStreamHandler):
 
         try:
             for _round in range(max_tool_rounds):
-                # Call Claude with tools (non-streaming for tool-use compatibility)
+                # Check barge-in before each tool round
+                if self._barge_in_event.is_set():
+                    logger.warning("Barge-in detected, aborting response generation")
+                    break
+
+                # Dynamic model selection based on query complexity
+                selected_model, selected_max_tokens = self._select_model(user_text)
+                logger.info("Model selected: %s (max_tokens=%d)", selected_model, selected_max_tokens)
+
                 api_kwargs: dict = {
-                    "model": self.claude_model,
-                    "max_tokens": 400,
+                    "model": selected_model,
+                    "max_tokens": selected_max_tokens,
                     "system": system_prompt,
                     "messages": self._messages,
                 }
                 if claude_tools:
                     api_kwargs["tools"] = claude_tools
 
-                response = await self.claude_client.messages.create(**api_kwargs)
-
-                # Separate text and tool_use blocks
-                text_parts: list[str] = []
+                # Stream Claude response for lower first-sentence latency
+                text_buffer = ""
                 tool_uses: list = []
-                for block in response.content:
-                    if block.type == "text":
-                        text_parts.append(block.text)
-                    elif block.type == "tool_use":
-                        tool_uses.append(block)
+                content_blocks: list = []
+                stop_reason = None
 
-                # Accumulate and TTS any text from this round
-                round_text = "".join(text_parts)
-                if round_text:
-                    full_response += round_text
-                    await self._tts_sentences(round_text)
+                async with self.claude_client.messages.stream(**api_kwargs) as stream:
+                    current_tool_block: dict | None = None
+
+                    async for event in stream:
+                        # Check barge-in within stream loop
+                        if self._barge_in_event.is_set():
+                            logger.warning("Barge-in during streaming, breaking")
+                            break
+
+                        if event.type == "content_block_start":
+                            block = event.content_block
+                            if block.type == "tool_use":
+                                current_tool_block = {
+                                    "type": "tool_use",
+                                    "id": block.id,
+                                    "name": block.name,
+                                    "input_json": "",
+                                }
+                            elif block.type == "text":
+                                current_tool_block = None
+
+                        elif event.type == "content_block_delta":
+                            delta = event.delta
+                            if delta.type == "text_delta":
+                                text_buffer += delta.text
+                                # Flush complete sentences for immediate TTS
+                                while True:
+                                    split_idx = -1
+                                    for i, ch in enumerate(text_buffer):
+                                        if ch in SENTENCE_ENDINGS:
+                                            split_idx = i
+                                            break
+                                    if split_idx < 0:
+                                        break
+                                    sentence = text_buffer[: split_idx + 1].strip()
+                                    text_buffer = text_buffer[split_idx + 1 :]
+                                    if sentence:
+                                        # Parse emotion tag (appears at start of response)
+                                        sentence, emotion = self._parse_emotion(sentence)
+                                        if not sentence:
+                                            continue
+                                        tts_speed = EMOTION_TTS_SPEED.get(emotion, 1.0)
+                                        full_response += sentence
+                                        await self.output_queue.put(
+                                            AdditionalOutputs({"role": "assistant", "content": sentence})
+                                        )
+                                        self._enqueue_tts(sentence, tts_speed)
+
+                            elif delta.type == "input_json_delta" and current_tool_block:
+                                current_tool_block["input_json"] += delta.partial_json
+
+                        elif event.type == "content_block_stop":
+                            if current_tool_block and current_tool_block["type"] == "tool_use":
+                                tool_uses.append(current_tool_block)
+                                content_blocks.append(current_tool_block)
+                                current_tool_block = None
+
+                        elif event.type == "message_delta":
+                            stop_reason = getattr(event.delta, "stop_reason", None)
+
+                # Flush remaining text buffer
+                if text_buffer.strip():
+                    sentence = text_buffer.strip()
+                    sentence, emotion = self._parse_emotion(sentence)
+                    if sentence:
+                        tts_speed = EMOTION_TTS_SPEED.get(emotion, 1.0)
+                        full_response += sentence
+                        await self.output_queue.put(
+                            AdditionalOutputs({"role": "assistant", "content": sentence})
+                        )
+                        self._enqueue_tts(sentence, tts_speed)
 
                 # If no tool use, we're done
-                if response.stop_reason != "tool_use" or not tool_uses:
+                if stop_reason != "tool_use" or not tool_uses:
                     break
 
-                # Store assistant message with full content blocks (required for multi-turn tool use)
+                # Build assistant content blocks for multi-turn tool use
+                assistant_content: list[dict] = []
+                # Add text block if we had any text before tools
+                if full_response:
+                    assistant_content.append({"type": "text", "text": full_response})
+                # Add tool_use blocks
+                import json as _json
+                for tu in tool_uses:
+                    try:
+                        parsed_input = _json.loads(tu["input_json"]) if tu["input_json"] else {}
+                    except _json.JSONDecodeError:
+                        parsed_input = {}
+                    assistant_content.append({
+                        "type": "tool_use",
+                        "id": tu["id"],
+                        "name": tu["name"],
+                        "input": parsed_input,
+                    })
+
                 self._messages.append({
                     "role": "assistant",
-                    "content": [_content_block_to_dict(b) for b in response.content],
+                    "content": assistant_content,
                 })
 
                 # Execute each tool call
                 tool_results: list[dict] = []
                 for tu in tool_uses:
-                    import json as _json
+                    try:
+                        parsed_input = _json.loads(tu["input_json"]) if tu["input_json"] else {}
+                    except _json.JSONDecodeError:
+                        parsed_input = {}
 
-                    logger.warning("Tool call: %s(%s)", tu.name, tu.input)
+                    logger.warning("Tool call: %s(%s)", tu["name"], parsed_input)
                     result = await dispatch_tool_call(
-                        tu.name, _json.dumps(tu.input), self.deps
+                        tu["name"], _json.dumps(parsed_input), self.deps
                     )
-                    logger.warning("Tool result: %s → %s", tu.name, result)
+                    logger.warning("Tool result: %s → %s", tu["name"], result)
 
                     # Emit tool usage to chatbot UI
                     await self.output_queue.put(
                         AdditionalOutputs({
                             "role": "assistant",
-                            "content": f"[tool: {tu.name}] {result}",
-                            "metadata": {"title": f"Used tool {tu.name}", "status": "done"},
+                            "content": f"[tool: {tu['name']}] {result}",
+                            "metadata": {"title": f"Used tool {tu['name']}", "status": "done"},
                         })
                     )
 
                     tool_results.append({
                         "type": "tool_result",
-                        "tool_use_id": tu.id,
+                        "tool_use_id": tu["id"],
                         "content": _json.dumps(result),
                     })
 
                 # Send tool results back to Claude
                 self._messages.append({"role": "user", "content": tool_results})
+                # Reset for next round (tool follow-up text)
+                full_response = ""
                 # Loop continues — Claude will generate follow-up text
 
         except Exception as e:
@@ -541,63 +1001,51 @@ class ClaudePipelineHandler(AsyncStreamHandler):
         self._model_speaking = False
         logger.warning("Response complete: %d chars", len(full_response))
 
-    async def _tts_sentences(self, text: str) -> None:
-        """Split text at sentence boundaries and TTS each sentence."""
-        buffer = ""
-        for char in text:
-            buffer += char
-            if char in SENTENCE_ENDINGS:
-                sentence = buffer.strip()
-                if sentence:
-                    await self.output_queue.put(
-                        AdditionalOutputs({"role": "assistant", "content": sentence})
-                    )
-                    await self._tts_and_emit(sentence)
-                buffer = ""
-        # Flush remaining
-        if buffer.strip():
-            await self.output_queue.put(
-                AdditionalOutputs({"role": "assistant", "content": buffer.strip()})
-            )
-            await self._tts_and_emit(buffer.strip())
+    # ------------------------------------------------------------------ #
+    #  TTS worker: sequential queue ensures sentence ordering
+    # ------------------------------------------------------------------ #
+    async def _tts_worker(self) -> None:
+        """Drain TTS queue sequentially — guarantees sentence playback order."""
+        while not self._shutdown_requested:
+            try:
+                item = await asyncio.wait_for(self._tts_queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            if item is None:
+                break  # Shutdown sentinel
+            text, speed = item
+            await self._tts_and_emit(text, speed)
+
+    def _enqueue_tts(self, text: str, speed: float = 1.0) -> None:
+        """Enqueue a sentence for sequential TTS playback (non-blocking)."""
+        self._tts_queue.put_nowait((text, speed))
 
     # ------------------------------------------------------------------ #
-    #  TTS: Edge-TTS → MP3 → PCM 16kHz → output queue
+    #  TTS: CosyVoice (preferred) or Edge-TTS → PCM 16kHz → output queue
     # ------------------------------------------------------------------ #
-    async def _tts_and_emit(self, text: str) -> None:
+    async def _tts_and_emit(self, text: str, speed: float = 1.0) -> None:
         """Convert text to speech and push PCM chunks to output queue."""
+        # Check barge-in before starting TTS for this sentence
+        if self._barge_in_event.is_set():
+            logger.debug("Barge-in: skipping TTS for '%s'", text[:30])
+            return
         self._last_audio_data_time = _time.time()
 
+        tts_provider = os.environ.get("CLAUDE_TTS_PROVIDER", "edge").lower()
+
         try:
-            import edge_tts
-            from pydub import AudioSegment
+            if tts_provider == "cosyvoice":
+                pcm_array = await self._tts_cosyvoice(text, speed)
+            else:
+                pcm_array = await self._tts_edge(text, speed)
 
-            # Generate MP3 via Edge-TTS
-            temp_path = tempfile.mktemp(suffix=".mp3")
-            communicate = edge_tts.Communicate(text, self.tts_voice, rate="+5%")
-            await communicate.save(temp_path)
-
-            with open(temp_path, "rb") as f:
-                mp3_data = f.read()
-            os.unlink(temp_path)
-
-            if not mp3_data:
-                logger.warning("Edge-TTS returned empty audio for: %s", text[:30])
+            if pcm_array is None or len(pcm_array) == 0:
+                logger.warning("TTS returned empty audio for: %s", text[:30])
                 return
-
-            # Decode MP3 → PCM 16kHz mono 16-bit
-            audio_seg = AudioSegment.from_mp3(io.BytesIO(mp3_data))
-            audio_seg = (
-                audio_seg.set_frame_rate(SAMPLE_RATE)
-                .set_channels(1)
-                .set_sample_width(2)
-            )
-            pcm_array = np.frombuffer(audio_seg.raw_data, dtype=np.int16)
 
             # Feed head wobbler for audio-reactive motion
             if self.deps.head_wobbler is not None:
                 import base64
-
                 self.deps.head_wobbler.feed(
                     base64.b64encode(pcm_array.tobytes()).decode()
                 )
@@ -605,14 +1053,92 @@ class ClaudePipelineHandler(AsyncStreamHandler):
             # Push PCM in ~200ms chunks for smooth streaming output
             chunk_samples = SAMPLE_RATE // 5  # 3200 samples = 200ms
             for i in range(0, len(pcm_array), chunk_samples):
+                if self._barge_in_event.is_set():
+                    break
                 chunk = pcm_array[i : i + chunk_samples]
                 await self.output_queue.put((SAMPLE_RATE, chunk))
                 self._last_audio_data_time = _time.time()
 
-            logger.warning("TTS emitted: %d samples for '%s'", len(pcm_array), text[:30])
+            logger.warning("TTS[%s] emitted: %d samples for '%s'", tts_provider, len(pcm_array), text[:30])
 
         except Exception as e:
             logger.error("TTS failed for '%s': %s", text[:30], e)
+
+    async def _tts_cosyvoice(self, text: str, speed: float = 1.0) -> Optional[NDArray[np.int16]]:
+        """Generate speech via CosyVoice HTTP API (Mac-side server)."""
+        import json as _json
+        cosyvoice_url = os.environ.get("COSYVOICE_URL", "http://192.168.0.98:8096")
+
+        try:
+            import aiohttp
+            payload = _json.dumps({"text": text, "speed": speed})
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{cosyvoice_url}/tts",
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status != 200:
+                        error = await resp.text()
+                        logger.warning("CosyVoice error %d: %s", resp.status, error[:100])
+                        # Fallback to Edge-TTS
+                        logger.warning("Falling back to Edge-TTS")
+                        return await self._tts_edge(text, speed)
+                    pcm_bytes = await resp.read()
+                    return np.frombuffer(pcm_bytes, dtype=np.int16)
+        except ImportError:
+            # aiohttp not available, use urllib
+            import urllib.request
+            payload = _json.dumps({"text": text, "speed": speed}).encode()
+            req = urllib.request.Request(
+                f"{cosyvoice_url}/tts",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    pcm_bytes = resp.read()
+                    return np.frombuffer(pcm_bytes, dtype=np.int16)
+            except Exception as e:
+                logger.warning("CosyVoice urllib fallback failed: %s", e)
+                return await self._tts_edge(text, speed)
+        except Exception as e:
+            logger.warning("CosyVoice failed, falling back to Edge-TTS: %s", e)
+            return await self._tts_edge(text, speed)
+
+    async def _tts_edge(self, text: str, speed: float = 1.0) -> Optional[NDArray[np.int16]]:
+        """Generate speech via Edge-TTS (cloud, free).
+
+        Args:
+            text: Text to synthesize.
+            speed: Speech speed multiplier (1.0=normal, 1.1=+10%, 0.9=-10%).
+        """
+        import edge_tts
+        from pydub import AudioSegment
+
+        # Convert float speed to Edge-TTS rate format: "+10%", "-5%", etc.
+        rate_pct = round((speed - 1.0) * 100)
+        rate_str = f"+{rate_pct}%" if rate_pct >= 0 else f"{rate_pct}%"
+
+        temp_path = tempfile.mktemp(suffix=".mp3")
+        communicate = edge_tts.Communicate(text, self.tts_voice, rate=rate_str)
+        await communicate.save(temp_path)
+
+        with open(temp_path, "rb") as f:
+            mp3_data = f.read()
+        os.unlink(temp_path)
+
+        if not mp3_data:
+            return None
+
+        audio_seg = AudioSegment.from_mp3(io.BytesIO(mp3_data))
+        audio_seg = (
+            audio_seg.set_frame_rate(SAMPLE_RATE)
+            .set_channels(1)
+            .set_sample_width(2)
+        )
+        return np.frombuffer(audio_seg.raw_data, dtype=np.int16)
 
     # ------------------------------------------------------------------ #
     #  Audio output: emit()

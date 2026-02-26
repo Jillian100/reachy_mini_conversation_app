@@ -21,6 +21,53 @@ from reachy_mini_conversation_app.utils import (
     log_connection_troubleshooting,
 )
 
+# --- MONKEY PATCH START ---
+# On macOS: patch zenoh.open to always connect directly to the WiFi robot IP.
+# This bypasses multicast discovery which is unreliable on home/studio networks.
+if sys.platform == "darwin":
+    import json as _json
+    import zenoh as _zenoh
+
+    _ROBOT_IP = os.environ.get("ROBOT_IP", "192.168.0.72")
+    _original_zenoh_open = _zenoh.open
+
+    def _direct_connect_open(config):
+        """Force direct TCP connection to robot instead of multicast discovery."""
+        _direct_cfg = _zenoh.Config.from_json5(_json.dumps({
+            "mode": "client",
+            "connect": {"endpoints": [f"tcp/{_ROBOT_IP}:7447"]},
+        }))
+        print(f"[MonkeyPatch] zenoh.open → tcp/{_ROBOT_IP}:7447")
+        return _original_zenoh_open(_direct_cfg)
+
+    _zenoh.open = _direct_connect_open
+
+    # Patch ReachyMini.__init__ to force no_media on macOS (GStreamer not available)
+    # After init, silence the media_manager logger which spams at WARNING level
+    import logging as _logging
+    from reachy_mini import ReachyMini as _ReachyMini
+    _original_init = _ReachyMini.__init__
+
+    def _patched_init(self, *args, **kwargs):
+        kwargs["media_backend"] = "no_media"
+        print("[MonkeyPatch] media_backend=no_media (macOS Gradio mode)")
+        _original_init(self, *args, **kwargs)
+        # SDK sets logger level inside __init__; override it after
+        _logging.getLogger("reachy_mini.media.media_manager").setLevel(_logging.ERROR)
+
+    _ReachyMini.__init__ = _patched_init
+
+    # Also patch ReachyMiniApp to skip robot-side GStreamer media (redundant safety)
+    from reachy_mini.apps.app import ReachyMiniApp as _ReachyMiniApp
+    _original_wrapped_run = _ReachyMiniApp.wrapped_run
+
+    def _patched_wrapped_run(self):
+        self.media_backend = "no_media"
+        _original_wrapped_run(self)
+
+    _ReachyMiniApp.wrapped_run = _patched_wrapped_run
+# --- MONKEY PATCH END ---
+
 
 def update_chatbot(chatbot: List[Dict[str, Any]], response: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Update the chatbot with AdditionalOutputs."""
@@ -49,7 +96,8 @@ def run(
     from reachy_mini_conversation_app.audio.head_wobbler import HeadWobbler
 
     # Backend selection: "openai" (default), "gemini", or "claude"
-    conversation_backend = os.environ.get("CONVERSATION_BACKEND", "openai").lower()
+    # [MODIFIED] Default to "gemini" for Amelie
+    conversation_backend = os.environ.get("CONVERSATION_BACKEND", "gemini").lower()
     if conversation_backend == "gemini":
         from reachy_mini_conversation_app.gemini_live_handler import GeminiLiveHandler as ConversationHandler
     elif conversation_backend == "claude":
@@ -59,6 +107,7 @@ def run(
 
     logger = setup_logger(args.debug)
     logger.info("Starting Reachy Mini Conversation App")
+    logger.info(f"Backend selected: {conversation_backend.upper()}")
 
     if args.no_camera and args.head_tracker is not None:
         logger.warning(
@@ -140,10 +189,22 @@ def run(
     stream_manager: gr.Blocks | LocalStream | None = None
 
     if args.gradio:
+        # Determine API Key label and default value based on backend
+        if conversation_backend == "gemini":
+            key_label = "Gemini API Key"
+            default_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        elif conversation_backend == "claude":
+             key_label = "Anthropic API Key"
+             default_key = os.environ.get("ANTHROPIC_API_KEY")
+        else:
+            key_label = "OPENAI API Key"
+            default_key = os.environ.get("OPENAI_API_KEY")
+
         api_key_textbox = gr.Textbox(
-            label="OPENAI API Key",
+            label=key_label,
             type="password",
-            value=os.getenv("OPENAI_API_KEY") if not get_space() else "",
+            value=default_key if (not get_space() and default_key) else "",
+
         )
 
         from reachy_mini_conversation_app.gradio_personality import PersonalityUI
