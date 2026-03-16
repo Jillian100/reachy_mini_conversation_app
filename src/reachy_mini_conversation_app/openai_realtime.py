@@ -27,6 +27,17 @@ from reachy_mini_conversation_app.tools.core_tools import (
 
 logger = logging.getLogger(__name__)
 
+import os
+import time as _time_mod
+
+# Speech gate: RMS energy threshold to filter distant speech / background noise.
+# Only audio louder than this reaches OpenAI. OpenAI's server-side VAD handles the rest.
+# 0 = disabled. 0.06 = filter distant speech, pass close-range conversation.
+OPENAI_ENERGY_GATE: Final[float] = float(os.environ.get("OPENAI_ENERGY_GATE", os.environ.get("GEMINI_ENERGY_GATE", "0.06")))
+OPENAI_ENERGY_HOLD: Final[float] = float(os.environ.get("OPENAI_ENERGY_HOLD", os.environ.get("GEMINI_ENERGY_HOLD", "2.0")))
+OPENAI_ENERGY_PREBUFFER: Final[float] = float(os.environ.get("OPENAI_ENERGY_PREBUFFER", os.environ.get("GEMINI_ENERGY_PREBUFFER", "0.3")))
+OPENAI_SPEECH_BAND_RATIO: Final[float] = float(os.environ.get("OPENAI_SPEECH_BAND_RATIO", os.environ.get("GEMINI_SPEECH_BAND_RATIO", "0")))
+
 OPEN_AI_INPUT_SAMPLE_RATE: Final[Literal[24000]] = 24000
 OPEN_AI_OUTPUT_SAMPLE_RATE: Final[Literal[24000]] = 24000
 
@@ -72,6 +83,18 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         # Internal lifecycle flags
         self._shutdown_requested: bool = False
         self._connected_event: asyncio.Event = asyncio.Event()
+
+        # Echo suppression: mute mic while robot is speaking
+        self._model_speaking: bool = False
+        self._last_audio_delta_time: float = 0.0
+
+        # Speech gate: filter distant speech before sending to OpenAI
+        self._energy_gate_open: bool = False
+        self._energy_gate_last_active: float = 0.0
+        from collections import deque
+        self._prebuffer: deque[str] = deque(
+            maxlen=max(1, int(OPENAI_ENERGY_PREBUFFER / 0.02))
+        )
 
     def copy(self) -> "OpenaiRealtimeHandler":
         """Create a copy of the handler."""
@@ -243,7 +266,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                                     "type": "audio/pcm",
                                     "rate": self.input_sample_rate,
                                 },
-                                "transcription": {"model": "gpt-4o-transcribe", "language": "en"},
+                                "transcription": {"model": "gpt-4o-transcribe"},
                                 "turn_detection": {
                                     "type": "server_vad",
                                     "interrupt_response": True,
@@ -284,6 +307,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             async for event in self.connection:
                 logger.debug(f"OpenAI event: {event.type}")
                 if event.type == "input_audio_buffer.speech_started":
+                    self._model_speaking = False  # User barge-in: stop echo suppression
                     if hasattr(self, "_clear_queue") and callable(self._clear_queue):
                         self._clear_queue()
                     if self.deps.head_wobbler is not None:
@@ -301,6 +325,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     "response.audio.completed",  # legacy (for safety)
                     "response.completed",  # text-only completion
                 ):
+                    self._model_speaking = False
                     logger.debug("response completed")
 
                 if event.type == "response.created":
@@ -350,8 +375,10 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     logger.debug(f"Assistant transcript: {event.transcript}")
                     await self.output_queue.put(AdditionalOutputs({"role": "assistant", "content": event.transcript}))
 
-                # Handle audio delta
+                # Handle audio delta — model is speaking
                 if event.type in ("response.audio.delta", "response.output_audio.delta"):
+                    self._model_speaking = True
+                    self._last_audio_delta_time = _time_mod.time()
                     if self.deps.head_wobbler is not None:
                         self.deps.head_wobbler.feed(event.delta)
                     self.last_activity_time = asyncio.get_event_loop().time()
@@ -483,6 +510,15 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         if not self.connection:
             return
 
+        # Echo suppression: mute mic while robot is speaking to prevent feedback loop.
+        # Auto-reset after 3s of no new audio delta (safety valve).
+        if self._model_speaking:
+            if _time_mod.time() - self._last_audio_delta_time > 3.0:
+                self._model_speaking = False
+                logger.debug("Echo suppression auto-reset (3s timeout)")
+            else:
+                return
+
         input_sample_rate, audio_frame = frame
 
         # Reshape if needed
@@ -501,7 +537,59 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         # Cast if needed
         audio_frame = audio_to_int16(audio_frame)
 
-        # Send to OpenAI (guard against races during reconnect)
+        # Speech gate: filter distant speech / background noise by RMS + optional SBER.
+        # OpenAI's server-side VAD handles speech detection, but we gate input to
+        # prevent distant conversations (e.g. Ian talking to Mac terminal) from triggering.
+        if OPENAI_ENERGY_GATE > 0:
+            audio_f32 = audio_frame.astype(np.float32) / 32768.0
+            rms = float(np.sqrt(np.mean(audio_f32 ** 2)))
+            now = _time_mod.monotonic()
+
+            # Optional SBER check (filters music; 0 = disabled for OpenAI since server VAD handles it)
+            is_speech_like = True
+            if OPENAI_SPEECH_BAND_RATIO > 0 and len(audio_f32) >= 256:
+                fft = np.fft.rfft(audio_f32)
+                power = np.abs(fft) ** 2
+                freqs = np.fft.rfftfreq(len(audio_f32), 1.0 / OPEN_AI_INPUT_SAMPLE_RATE)
+                speech_mask = (freqs >= 300) & (freqs <= 3400)
+                total_power = float(np.sum(power)) + 1e-10
+                speech_ratio = float(np.sum(power[speech_mask])) / total_power
+                is_speech_like = speech_ratio >= OPENAI_SPEECH_BAND_RATIO
+
+            audio_b64 = base64.b64encode(audio_frame.tobytes()).decode("utf-8")
+
+            if rms >= OPENAI_ENERGY_GATE and is_speech_like:
+                if not self._energy_gate_open:
+                    self._energy_gate_open = True
+                    # Flush pre-buffer so speech onset isn't lost
+                    for buffered in self._prebuffer:
+                        try:
+                            await self.connection.input_audio_buffer.append(audio=buffered)
+                        except Exception:
+                            pass
+                    self._prebuffer.clear()
+                    logger.debug("Speech gate OPEN (RMS=%.4f)", rms)
+                self._energy_gate_last_active = now
+            else:
+                if self._energy_gate_open:
+                    if now - self._energy_gate_last_active > OPENAI_ENERGY_HOLD:
+                        self._energy_gate_open = False
+                        self._prebuffer.clear()
+                        logger.debug("Speech gate CLOSED")
+                        return
+                    # Hold period — forward audio (mid-sentence pause)
+                else:
+                    self._prebuffer.append(audio_b64)
+                    return
+
+            # Gate passed — send to OpenAI
+            try:
+                await self.connection.input_audio_buffer.append(audio=audio_b64)
+            except Exception as e:
+                logger.debug("Dropping audio frame: connection not ready (%s)", e)
+            return
+
+        # No gate — send everything
         try:
             audio_message = base64.b64encode(audio_frame.tobytes()).decode("utf-8")
             await self.connection.input_audio_buffer.append(audio=audio_message)

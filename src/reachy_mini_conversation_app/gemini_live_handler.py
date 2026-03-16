@@ -38,6 +38,13 @@ from reachy_mini_conversation_app.tools.core_tools import (
 
 logger = logging.getLogger(__name__)
 
+# Debug: speech gate log to file (tail -f /tmp/speech_gate.log on robot)
+_gate_fh = logging.FileHandler("/tmp/speech_gate.log")
+_gate_fh.setLevel(logging.DEBUG)
+_gate_fh.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S"))
+logger.addHandler(_gate_fh)
+logger.setLevel(logging.DEBUG)
+
 # Gemini Live API audio parameters
 GEMINI_INPUT_SAMPLE_RATE: Final[int] = 16000
 GEMINI_OUTPUT_SAMPLE_RATE: Final[int] = 24000
@@ -48,6 +55,21 @@ DEFAULT_GEMINI_MODEL: Final[str] = "models/gemini-2.5-flash-native-audio-preview
 
 # Volume gain for Gemini audio output (Gemini tends to output quieter audio)
 VOLUME_GAIN: Final[float] = float(os.environ.get("GEMINI_VOLUME_GAIN", "3.0"))
+
+# Energy gate: minimum RMS (float32 scale) to forward audio to Gemini.
+# Filters ambient / distant speech so 圍棋 only responds to direct conversation.
+# 0 = disabled (send everything). Typical direct speech ≈ 0.03–0.10, ambient ≈ 0.005–0.02.
+ENERGY_GATE_THRESHOLD: Final[float] = float(os.environ.get("GEMINI_ENERGY_GATE", "0.06"))
+# Hold time: keep forwarding audio for this many seconds after energy drops below threshold.
+# Prevents cutting off pauses between words within a sentence.
+ENERGY_GATE_HOLD_SEC: Final[float] = float(os.environ.get("GEMINI_ENERGY_HOLD", "2.0"))
+# Pre-buffer: seconds of audio to keep in lookback ring buffer.
+# When energy gate triggers, the pre-buffer is flushed first so speech onset isn't lost.
+ENERGY_GATE_PREBUFFER_SEC: Final[float] = float(os.environ.get("GEMINI_ENERGY_PREBUFFER", "0.3"))
+# Speech Band Energy Ratio (SBER): ratio of energy in 300-3400 Hz vs full spectrum.
+# Human speech concentrates ~60-80% energy in this band; music spreads across full spectrum.
+# Combined with RMS gate: audio must pass BOTH thresholds to reach Gemini.
+SPEECH_BAND_RATIO_THRESHOLD: Final[float] = float(os.environ.get("GEMINI_SPEECH_BAND_RATIO", "0.5"))
 
 # OpenAI voice → Gemini voice mapping
 _OPENAI_TO_GEMINI_VOICE: Dict[str, str] = {
@@ -130,6 +152,16 @@ class GeminiLiveHandler(AsyncStreamHandler):
         # Echo suppression: mute mic input while robot is speaking
         self._model_speaking = False
         self._last_audio_data_time: float = 0.0
+
+        # Energy gate: filter out ambient/distant speech before sending to Gemini
+        self._energy_gate_last_active: float = 0.0  # monotonic timestamp
+        self._energy_gate_open: bool = False  # True while gate is open (speech detected)
+        # Pre-buffer: ring buffer of recent audio frames for lookback on speech onset.
+        # Max frames = prebuffer_sec / frame_duration. Each frame ≈ 20-40ms at 16kHz.
+        from collections import deque
+        self._prebuffer: deque[bytes] = deque(
+            maxlen=max(1, int(ENERGY_GATE_PREBUFFER_SEC / 0.02))  # ~15 frames for 300ms
+        )
 
         # Audio buffer for resampling (accumulate small Gemini chunks before output)
         self._audio_buffer = bytearray()
@@ -525,10 +557,67 @@ class GeminiLiveHandler(AsyncStreamHandler):
         # Ensure int16
         audio_frame = audio_to_int16(audio_frame)
 
+        # Speech gate: two-factor authentication for human speech.
+        # Factor 1: RMS energy (volume) — filters very quiet ambient noise.
+        # Factor 2: Speech Band Energy Ratio (SBER) — filters music/TV.
+        #   Human speech concentrates 60-80% energy in 300-3400 Hz.
+        #   Music/noise spreads energy across full spectrum (ratio < 0.4).
+        # Audio must pass BOTH to reach Gemini.
+        pcm_bytes = audio_frame.tobytes()
+
+        if ENERGY_GATE_THRESHOLD > 0:
+            import time as _time
+            audio_f32 = audio_frame.astype(np.float32) / 32768.0
+            rms = float(np.sqrt(np.mean(audio_f32 ** 2)))
+            now = _time.monotonic()
+
+            # Speech band energy ratio via FFT
+            speech_ratio = -1.0
+            is_speech_like = True  # default pass if SBER disabled
+            if SPEECH_BAND_RATIO_THRESHOLD > 0 and len(audio_f32) >= 256:
+                fft = np.fft.rfft(audio_f32)
+                power = np.abs(fft) ** 2
+                freqs = np.fft.rfftfreq(len(audio_f32), 1.0 / GEMINI_INPUT_SAMPLE_RATE)
+                speech_mask = (freqs >= 300) & (freqs <= 3400)
+                total_power = float(np.sum(power)) + 1e-10
+                speech_ratio = float(np.sum(power[speech_mask])) / total_power
+                is_speech_like = speech_ratio >= SPEECH_BAND_RATIO_THRESHOLD
+
+            if rms >= ENERGY_GATE_THRESHOLD and is_speech_like:
+                # Speech detected (loud enough + right spectral shape)
+                if not self._energy_gate_open:
+                    self._energy_gate_open = True
+                    for buffered in self._prebuffer:
+                        try:
+                            await self.session.send(
+                                input={"data": buffered, "mime_type": "audio/pcm"}
+                            )
+                        except Exception:
+                            pass
+                    self._prebuffer.clear()
+                    logger.debug("Speech gate OPEN (RMS=%.4f, SBER=%.2f)", rms, speech_ratio)
+                self._energy_gate_last_active = now
+            else:
+                # Blocked: too quiet or wrong spectral shape (music/noise)
+                if self._energy_gate_open:
+                    if now - self._energy_gate_last_active > ENERGY_GATE_HOLD_SEC:
+                        self._energy_gate_open = False
+                        self._prebuffer.clear()
+                        logger.debug("Speech gate CLOSED (silence %.1fs)", now - self._energy_gate_last_active)
+                        return
+                    # Still in hold period → forward audio (mid-sentence pause)
+                else:
+                    # Log periodically (every ~5s) to show what's being blocked
+                    if not hasattr(self, '_last_block_log') or now - self._last_block_log > 5.0:
+                        self._last_block_log = now
+                        reason = "quiet" if rms < ENERGY_GATE_THRESHOLD else "music"
+                        logger.debug("BLOCKED (%s) RMS=%.4f SBER=%.2f", reason, rms, speech_ratio)
+                    self._prebuffer.append(pcm_bytes)
+                    return
         # Send raw PCM bytes to Gemini
         try:
             await self.session.send(
-                input={"data": audio_frame.tobytes(), "mime_type": "audio/pcm"}
+                input={"data": pcm_bytes, "mime_type": "audio/pcm"}
             )
         except Exception:
             # Session may be closing/reconnecting — drop frame silently
