@@ -73,7 +73,8 @@ class LocalStream:
         # Half-duplex echo prevention: mute mic while speaker is active
         self._speaker_active: bool = False
         self._speaker_end_time: float = 0.0  # monotonic timestamp
-        self._SPEAKER_TAIL_GUARD: float = 2.0  # seconds to keep mic muted after TTS ends
+        self._SPEAKER_TAIL_GUARD: float = 0.5  # seconds to keep mic muted after TTS ends
+        self._BARGE_IN_RMS: float = 0.10  # normal speech volume breaks through — robot yields
 
     # ---- Settings UI (only when API key is missing) ----
     def _read_env_lines(self, env_path: Path) -> list[str]:
@@ -494,17 +495,28 @@ class LocalStream:
         logger.debug(f"Audio recording started at {input_sample_rate} Hz")
 
         while not self._stop_event.is_set():
-            # Half-duplex gate: skip mic while speaker is playing + tail guard
             now = _time.monotonic()
-            if self._speaker_active or now < self._speaker_end_time:
-                self._robot.media.get_audio_sample()  # drain mic buffer to prevent buildup
+            audio_frame = self._robot.media.get_audio_sample()
+            if audio_frame is None:
                 await asyncio.sleep(0)
                 continue
 
-            audio_frame = self._robot.media.get_audio_sample()
-            if audio_frame is not None:
-                await self.handler.receive((input_sample_rate, audio_frame))
-            await asyncio.sleep(0)  # avoid busy loop
+            # Barge-in: if speaker active, only let through loud speech (e.g. 「停」)
+            if self._speaker_active or now < self._speaker_end_time:
+                import numpy as _np
+                _samples = _np.frombuffer(audio_frame, dtype=_np.int16).astype(_np.float32) / 32768.0
+                _rms = float(_np.sqrt(_np.mean(_samples ** 2)))
+                if _rms < self._BARGE_IN_RMS:
+                    await asyncio.sleep(0)
+                    continue
+                # Loud enough — barge-in! Clear speaker and forward audio
+                self._speaker_active = False
+                self._speaker_end_time = 0.0
+                self.clear_audio_queue()
+                logger.info("Barge-in detected (RMS=%.3f), interrupting playback", _rms)
+
+            await self.handler.receive((input_sample_rate, audio_frame))
+            await asyncio.sleep(0)
 
     async def play_loop(self) -> None:
         """Fetch outputs from the handler: log text and play audio frames.
