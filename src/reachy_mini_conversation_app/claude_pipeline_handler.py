@@ -504,6 +504,8 @@ class ClaudePipelineHandler(AsyncStreamHandler):
                 # DoA: look toward sound source on speech start
                 if vad_result.speech_started:
                     self._look_toward_speaker()
+                    self.deps.movement_manager.set_listening(True)
+                    self.deps.movement_manager.trigger_listening_reaction()
                 if vad_result.speech_ended and vad_result.speech_audio:
                     logger.warning("Silero VAD: speech ended, launching pipeline...")
                     asyncio.create_task(self._process_speech(vad_result.speech_audio))
@@ -522,6 +524,8 @@ class ClaudePipelineHandler(AsyncStreamHandler):
                 self._is_speech = True
                 # DoA: look toward sound source on speech start
                 self._look_toward_speaker()
+                self.deps.movement_manager.set_listening(True)
+                self.deps.movement_manager.trigger_listening_reaction()
                 self._speech_start = now
                 self._audio_buffer = bytearray()
                 logger.debug("Speech started (RMS=%.4f)", rms)
@@ -542,6 +546,7 @@ class ClaudePipelineHandler(AsyncStreamHandler):
                         "Speech ended (%.1fs), launching pipeline...",
                         speech_duration,
                     )
+                    self.deps.movement_manager.set_listening(False)
                     pcm_data = bytes(self._audio_buffer)
                     self._is_speech = False
                     self._audio_buffer = bytearray()
@@ -661,15 +666,8 @@ class ClaudePipelineHandler(AsyncStreamHandler):
                 logger.warning("Whisper returned empty/short text, skipping")
                 return
 
-            # Filter Whisper hallucinations: if language=zh but result has no CJK chars, discard
-            import unicodedata as _ud
-            _has_cjk = any(
-                _ud.category(c).startswith("Lo") and ord(c) > 0x2E80
-                for c in text
-            )
-            if not _has_cjk:
-                logger.warning("STT has no Chinese chars (Whisper hallucination), discarding: %s", text)
-                return
+            # Note: CJK hallucination filter removed — Whisper often misrecognizes
+            # Chinese as random English, causing valid speech to be discarded.
 
             logger.warning("STT result: %s", text)
 

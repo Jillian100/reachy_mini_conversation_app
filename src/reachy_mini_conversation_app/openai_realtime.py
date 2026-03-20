@@ -259,7 +259,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 await conn.session.update(
                     session={
                         "type": "realtime",
-                        "instructions": _instructions,
+                        "instructions": get_session_instructions(),
                         "audio": {
                             "input": {
                                 "format": {
