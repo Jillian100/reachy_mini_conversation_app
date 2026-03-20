@@ -398,6 +398,8 @@ class GeminiLiveHandler(AsyncStreamHandler):
                 self._clear_queue()
             if self.deps.head_wobbler is not None:
                 self.deps.head_wobbler.reset()
+            self.deps.movement_manager.set_listening(True)
+            self.deps.movement_manager.trigger_listening_reaction()
 
         # Turn complete — flush remaining audio buffer and re-enable mic
         if hasattr(sc, "turn_complete") and sc.turn_complete:
@@ -587,6 +589,9 @@ class GeminiLiveHandler(AsyncStreamHandler):
                 # Speech detected (loud enough + right spectral shape)
                 if not self._energy_gate_open:
                     self._energy_gate_open = True
+                    # Instant physical reaction: lean in to listen
+                    self.deps.movement_manager.set_listening(True)
+                    self.deps.movement_manager.trigger_listening_reaction()
                     for buffered in self._prebuffer:
                         try:
                             await self.session.send(
@@ -602,6 +607,7 @@ class GeminiLiveHandler(AsyncStreamHandler):
                 if self._energy_gate_open:
                     if now - self._energy_gate_last_active > ENERGY_GATE_HOLD_SEC:
                         self._energy_gate_open = False
+                        self.deps.movement_manager.set_listening(False)
                         self._prebuffer.clear()
                         logger.debug("Speech gate CLOSED (silence %.1fs)", now - self._energy_gate_last_active)
                         return

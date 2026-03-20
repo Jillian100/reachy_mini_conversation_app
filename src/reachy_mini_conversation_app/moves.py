@@ -61,6 +61,51 @@ CONTROL_LOOP_FREQUENCY_HZ = 100.0  # Hz - Target frequency for the movement cont
 FullBodyPose = Tuple[NDArray[np.float32], Tuple[float, float], float]  # (head_pose_4x4, antennas, body_yaw)
 
 
+class ListeningReactionMove(Move):  # type: ignore
+    """Quick attentive head motion when user starts speaking.
+
+    Creates a subtle "lean in" effect: slight forward pitch + random side tilt.
+    Duration 0.35s — fast enough to feel instantaneous, smooth enough to avoid jerk.
+    After completion the robot holds this pose while _is_listening remains True.
+    """
+
+    def __init__(
+        self,
+        start_pose: NDArray[np.float32],
+        start_antennas: Tuple[float, float],
+    ):
+        self._start_pose = start_pose
+        self._start_antennas = np.array(start_antennas, dtype=np.float64)
+        self._duration = 0.35
+
+        # Randomise tilt direction and intensity for natural variety
+        roll_deg = float(np.random.choice([-3.0, 3.0]))
+        pitch_deg = float(np.random.uniform(-5.0, -3.0))  # always forward
+        z_offset = float(np.random.uniform(-0.008, -0.004))  # 4-8 mm down
+
+        self._target_pose = create_head_pose(
+            x=0, y=0, z=z_offset,
+            roll=roll_deg, pitch=pitch_deg, yaw=0,
+            degrees=True, mm=False,
+        )
+
+    @property
+    def duration(self) -> float:
+        return self._duration
+
+    def evaluate(
+        self, t: float,
+    ) -> tuple[NDArray[np.float64] | None, NDArray[np.float64] | None, float | None]:
+        progress = min(1.0, t / self._duration)
+        # Smoothstep ease-in-out
+        progress = progress * progress * (3.0 - 2.0 * progress)
+
+        head_pose = linear_pose_interpolation(
+            self._start_pose, self._target_pose, progress,
+        )
+        return (head_pose, self._start_antennas, 0.0)
+
+
 class BreathingMove(Move):  # type: ignore
     """Breathing move with interpolation to neutral and then continuous breathing patterns."""
 
@@ -372,6 +417,17 @@ class MovementManager:
                 return
         self._command_queue.put(("set_listening", listening))
 
+    def trigger_listening_reaction(self) -> None:
+        """Queue a quick attentive head motion for speech onset.
+
+        Creates a ListeningReactionMove from the robot's current pose so the
+        transition is seamless.  Actual Move creation happens inside the worker
+        thread (which has safe access to robot state).
+
+        Thread-safe: posted to the worker command queue.
+        """
+        self._command_queue.put(("listening_reaction", None))
+
     def _poll_signals(self, current_time: float) -> None:
         """Apply queued commands and pending offset updates."""
         self._apply_pending_offsets()
@@ -464,6 +520,27 @@ class MovementManager:
                 # Unfreeze: restart blending from frozen pose
                 self._antenna_unfreeze_blend = 0.0
             self.state.update_activity()
+        elif command == "listening_reaction":
+            # Only react when actively listening; avoid stacking duplicates
+            if not self._is_listening:
+                return
+            for m in self.move_queue:
+                if isinstance(m, ListeningReactionMove):
+                    return
+            if isinstance(self.state.current_move, ListeningReactionMove):
+                return
+            try:
+                _, current_antennas = self.current_robot.get_current_joint_positions()
+                current_head_pose = self.current_robot.get_current_head_pose()
+                move = ListeningReactionMove(
+                    start_pose=current_head_pose,
+                    start_antennas=current_antennas,
+                )
+                self.move_queue.append(move)
+                self.state.update_activity()
+                logger.debug("Queued listening reaction move")
+            except Exception as e:
+                logger.error("Failed to create listening reaction: %s", e)
         else:
             logger.warning("Unknown command received by MovementManager: %s", command)
 

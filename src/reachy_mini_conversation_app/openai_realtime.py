@@ -313,6 +313,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     if self.deps.head_wobbler is not None:
                         self.deps.head_wobbler.reset()
                     self.deps.movement_manager.set_listening(True)
+                    self.deps.movement_manager.trigger_listening_reaction()
                     logger.debug("User speech started")
 
                 if event.type == "input_audio_buffer.speech_stopped":
