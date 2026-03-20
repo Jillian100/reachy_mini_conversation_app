@@ -95,6 +95,13 @@ def run(
     from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
     from reachy_mini_conversation_app.audio.head_wobbler import HeadWobbler
 
+    # Override head_tracker from env var if not set via CLI
+    # (config.py has loaded .env by now via the imports above)
+    if args.head_tracker is None:
+        env_tracker = os.environ.get("REACHY_HEAD_TRACKER")
+        if env_tracker in ("yolo", "mediapipe"):
+            args.head_tracker = env_tracker
+
     # Backend selection: "openai" (default), "gemini", or "claude"
     # [MODIFIED] Default to "gemini" for Amelie
     conversation_backend = os.environ.get("CONVERSATION_BACKEND", "gemini").lower()
@@ -107,6 +114,7 @@ def run(
 
     logger = setup_logger(args.debug)
     logger.info("Starting Reachy Mini Conversation App")
+    logger.info(f"Head tracker: {args.head_tracker}")
     logger.info(f"Backend selected: {conversation_backend.upper()}")
 
     if args.no_camera and args.head_tracker is not None:

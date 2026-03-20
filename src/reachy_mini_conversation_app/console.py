@@ -70,6 +70,11 @@ class LocalStream:
         self._settings_initialized = False
         self._asyncio_loop = None
 
+        # Half-duplex echo prevention: mute mic while speaker is active
+        self._speaker_active: bool = False
+        self._speaker_end_time: float = 0.0  # monotonic timestamp
+        self._SPEAKER_TAIL_GUARD: float = 2.0  # seconds to keep mic muted after TTS ends
+
     # ---- Settings UI (only when API key is missing) ----
     def _read_env_lines(self, env_path: Path) -> list[str]:
         """Load env file contents or a template as a list of lines."""
@@ -479,18 +484,34 @@ class LocalStream:
         self.handler.output_queue = asyncio.Queue()
 
     async def record_loop(self) -> None:
-        """Read mic frames from the recorder and forward them to the handler."""
+        """Read mic frames from the recorder and forward them to the handler.
+
+        Half-duplex: mic is muted while speaker is active + tail guard.
+        This prevents the robot from hearing its own TTS output.
+        """
+        import time as _time
         input_sample_rate = self._robot.media.get_input_audio_samplerate()
         logger.debug(f"Audio recording started at {input_sample_rate} Hz")
 
         while not self._stop_event.is_set():
+            # Half-duplex gate: skip mic while speaker is playing + tail guard
+            now = _time.monotonic()
+            if self._speaker_active or now < self._speaker_end_time:
+                self._robot.media.get_audio_sample()  # drain mic buffer to prevent buildup
+                await asyncio.sleep(0)
+                continue
+
             audio_frame = self._robot.media.get_audio_sample()
             if audio_frame is not None:
                 await self.handler.receive((input_sample_rate, audio_frame))
             await asyncio.sleep(0)  # avoid busy loop
 
     async def play_loop(self) -> None:
-        """Fetch outputs from the handler: log text and play audio frames."""
+        """Fetch outputs from the handler: log text and play audio frames.
+
+        Sets _speaker_active flag so record_loop knows to mute mic.
+        """
+        import time as _time
         while not self._stop_event.is_set():
             handler_output = await self.handler.emit()
 
@@ -505,6 +526,7 @@ class LocalStream:
                         )
 
             elif isinstance(handler_output, tuple):
+                self._speaker_active = True  # GATE ON: mute mic
                 input_sample_rate, audio_data = handler_output
                 output_sample_rate = self._robot.media.get_output_audio_samplerate()
 
@@ -529,7 +551,15 @@ class LocalStream:
 
                 self._robot.media.push_audio_sample(audio_frame)
 
+                # Check if output queue is empty → speaker done → start tail guard
+                if self.handler.output_queue.empty():
+                    self._speaker_active = False
+                    self._speaker_end_time = _time.monotonic() + self._SPEAKER_TAIL_GUARD
+
             else:
+                if self._speaker_active:
+                    self._speaker_active = False
+                    self._speaker_end_time = _time.monotonic() + self._SPEAKER_TAIL_GUARD
                 logger.debug("Ignoring output type=%s", type(handler_output).__name__)
 
             await asyncio.sleep(0)  # yield to event loop

@@ -1,5 +1,6 @@
 import logging
 import argparse
+import os
 import warnings
 from typing import Any, Tuple, Optional
 
@@ -10,11 +11,14 @@ from reachy_mini_conversation_app.camera_worker import CameraWorker
 def parse_args() -> Tuple[argparse.Namespace, list]:  # type: ignore
     """Parse command line arguments."""
     parser = argparse.ArgumentParser("Reachy Mini Conversation App")
+    # Support env var REACHY_HEAD_TRACKER for daemon startup (no CLI args)
+    env_tracker = os.environ.get("REACHY_HEAD_TRACKER")
+    tracker_default = env_tracker if env_tracker in ("yolo", "mediapipe") else None
     parser.add_argument(
         "--head-tracker",
         choices=["yolo", "mediapipe", None],
-        default=None,
-        help="Choose head tracker (default: None)",
+        default=tracker_default,
+        help="Choose head tracker (default: None, or set REACHY_HEAD_TRACKER env var)",
     )
     parser.add_argument("--no-camera", default=False, action="store_true", help="Disable camera usage")
     parser.add_argument(

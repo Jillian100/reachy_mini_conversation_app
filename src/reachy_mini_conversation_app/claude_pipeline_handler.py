@@ -48,7 +48,7 @@ SAMPLE_RATE: Final[int] = 16000
 # Robot mic delivers float32 audio, so threshold must be in float32 scale
 SILENCE_THRESHOLD: Final[float] = float(os.environ.get("CLAUDE_VAD_THRESHOLD", "0.02"))
 SILENCE_DURATION: Final[float] = float(os.environ.get("CLAUDE_VAD_SILENCE", "1.0"))
-MIN_SPEECH_DURATION: Final[float] = 0.3  # Ignore bursts shorter than this
+MIN_SPEECH_DURATION: Final[float] = 1.0  # Ignore bursts shorter than this (raised from 0.3 to filter background noise)
 
 # Wake word: if set, only respond when transcription contains this word
 # Supports multiple variants separated by comma (handles Whisper transcription variations)
@@ -67,8 +67,8 @@ COMPLEX_TRIGGERS: Final[list[str]] = [
 ]
 MODEL_HAIKU: Final[str] = "claude-haiku-4-5-20251001"
 MODEL_SONNET: Final[str] = "claude-sonnet-4-6-20250514"
-MAX_TOKENS_HAIKU: Final[int] = 400
-MAX_TOKENS_SONNET: Final[int] = 800
+MAX_TOKENS_HAIKU: Final[int] = 80  # Voice conversation: 1-2 short sentences
+MAX_TOKENS_SONNET: Final[int] = 150  # Complex queries still concise
 
 # Emotion → TTS speed mapping (CosyVoice speed parameter)
 EMOTION_TTS_SPEED: Final[Dict[str, float]] = {
@@ -231,9 +231,13 @@ class ClaudePipelineHandler(AsyncStreamHandler):
         self._silence_start: float = 0.0
         self._speech_start: float = 0.0
 
-        # Echo suppression (same pattern as gemini_live_handler)
+        # Echo suppression: timestamp-based (most robust)
+        # After last TTS chunk, mic stays muted for ECHO_GUARD_SEC
         self._model_speaking = False
+        self._tts_active = False
         self._last_audio_data_time: float = 0.0
+        self._last_tts_emit_time: float = 0.0  # timestamp of last TTS chunk sent
+        self.ECHO_GUARD_SEC: float = 3.0  # seconds to mute mic after TTS ends (raised from 1.5)
 
         # Pipeline lock: True while STT→Claude→TTS is running
         self._processing = False
@@ -448,27 +452,28 @@ class ClaudePipelineHandler(AsyncStreamHandler):
         if not self._connected_event.is_set():
             return
 
-        # Barge-in detection: if robot is speaking and user speaks loudly, interrupt
-        if self._model_speaking:
-            if _time.time() - self._last_audio_data_time > 3.0:
-                self._model_speaking = False
-                logger.debug("Echo suppression auto-reset (3s timeout)")
-            else:
-                # Check for barge-in: user voice energy > threshold × 1.5
-                _, barge_frame = frame
-                if barge_frame.ndim == 2:
-                    barge_frame = barge_frame.ravel()
-                if barge_frame.dtype == np.int16:
-                    barge_f32 = barge_frame.astype(np.float32) / 32768.0
-                else:
-                    barge_f32 = barge_frame.astype(np.float32)
-                barge_rms = float(np.sqrt(np.mean(barge_f32 ** 2)))
-                if barge_rms > SILENCE_THRESHOLD * 1.5:
-                    await self._trigger_barge_in()
-                return
+        # Hard echo guard: mute mic for ECHO_GUARD_SEC after last TTS chunk
+        if self._last_tts_emit_time > 0:
+            elapsed = _time.time() - self._last_tts_emit_time
+            if elapsed < self.ECHO_GUARD_SEC:
+                return  # Completely ignore mic — echo territory
 
-        # Skip mic input while pipeline is processing
+        # Skip mic input while pipeline is processing (STT→Claude→TTS)
         if self._processing:
+            return
+
+        # Barge-in detection: if robot is speaking, allow loud voice to interrupt
+        if self._model_speaking or self._tts_active:
+            _, barge_frame = frame
+            if barge_frame.ndim == 2:
+                barge_frame = barge_frame.ravel()
+            if barge_frame.dtype == np.int16:
+                barge_f32 = barge_frame.astype(np.float32) / 32768.0
+            else:
+                barge_f32 = barge_frame.astype(np.float32)
+            barge_rms = float(np.sqrt(np.mean(barge_f32 ** 2)))
+            if barge_rms > SILENCE_THRESHOLD * 5.0:
+                await self._trigger_barge_in()
             return
 
         _, audio_frame = frame
@@ -627,6 +632,19 @@ class ClaudePipelineHandler(AsyncStreamHandler):
         if self._processing:
             logger.debug("Pipeline already running, skipping")
             return
+
+        # Pre-STT energy gate: skip if buffer average RMS is too low (ambient noise)
+        _MIN_BUFFER_RMS = 0.04  # Lowered: wake word provides addressee filtering
+        try:
+            audio_i16 = np.frombuffer(pcm_data, dtype=np.int16)
+            buf_rms = float(np.sqrt(np.mean((audio_i16.astype(np.float32) / 32768.0) ** 2)))
+            if buf_rms < _MIN_BUFFER_RMS:
+                logger.warning("Audio buffer RMS %.4f < %.4f, skipping (ambient noise)", buf_rms, _MIN_BUFFER_RMS)
+                return
+            logger.debug("Audio buffer RMS: %.4f (gate=%.4f)", buf_rms, _MIN_BUFFER_RMS)
+        except Exception:
+            pass  # Don't block pipeline on RMS check failure
+
         self._processing = True
         self._barge_in_event.clear()  # Reset barge-in for new utterance
         self.last_activity_time = asyncio.get_event_loop().time()
@@ -643,21 +661,34 @@ class ClaudePipelineHandler(AsyncStreamHandler):
                 logger.warning("Whisper returned empty/short text, skipping")
                 return
 
+            # Filter Whisper hallucinations: if language=zh but result has no CJK chars, discard
+            import unicodedata as _ud
+            _has_cjk = any(
+                _ud.category(c).startswith("Lo") and ord(c) > 0x2E80
+                for c in text
+            )
+            if not _has_cjk:
+                logger.warning("STT has no Chinese chars (Whisper hallucination), discarding: %s", text)
+                return
+
             logger.warning("STT result: %s", text)
 
-            # 2. Wake word filter (if configured)
+            # 2. Wake word filter: fuzzy match for "Amelie" in any Whisper transcription
+            # Matches: 美莉/美麗/美力/梅莉/艾美/愛美/Emily/Amelie/Amilie etc.
             if WAKE_WORDS:
+                import re as _re
                 text_lower = text.lower()
-                matched_word = None
-                for ww in WAKE_WORDS:
-                    if ww in text_lower:
-                        matched_word = ww
-                        break
-                if not matched_word:
+                # Fuzzy pattern: any Chinese char sounding like "mei li" or English "emily/amelie"
+                _FUZZY_PATTERN = _re.compile(
+                    r'[愛艾阿啊]?[美梅][莉麗力利里]|emily|amelie|amilie|emilie',
+                    _re.IGNORECASE,
+                )
+                match = _FUZZY_PATTERN.search(text)
+                if not match:
                     logger.warning("Wake word not found, ignoring: %s", text)
                     return
+                matched_word = match.group(0)
                 # Strip the matched wake word so Claude gets the actual request
-                import re as _re
                 text = _re.sub(
                     _re.escape(matched_word), "", text, count=1, flags=_re.IGNORECASE
                 ).strip()
@@ -688,6 +719,19 @@ class ClaudePipelineHandler(AsyncStreamHandler):
         except Exception as e:
             logger.error("Pipeline error: %s", e, exc_info=True)
         finally:
+            # Wait for TTS queue to fully drain before reopening mic
+            # This prevents echo: mic picks up TTS playback → infinite loop
+            try:
+                await asyncio.wait_for(self._tts_queue.join(), timeout=30.0)
+            except (asyncio.TimeoutError, Exception):
+                pass
+            # Extra guard: wait for speaker tail to dissipate
+            await asyncio.sleep(0.8)
+            # Flush any accumulated speech buffer (echo residue)
+            self._audio_buffer = bytearray()
+            self._is_speech = False
+            self._model_speaking = False
+            self._tts_active = False
             self._processing = False
 
     @staticmethod
@@ -735,10 +779,11 @@ class ClaudePipelineHandler(AsyncStreamHandler):
         wav_buffer.name = "speech.wav"  # Whisper API needs a filename hint
 
         try:
-            # Auto-detect language (supports Chinese-English mixed speech)
+            # Force Chinese to avoid misdetection (zh covers Mandarin + mixed en)
             response = await self.whisper_client.audio.transcriptions.create(
                 model=self._whisper_model,
                 file=wav_buffer,
+                language="zh",
             )
             return response.text
         except Exception as e:
@@ -979,10 +1024,27 @@ class ClaudePipelineHandler(AsyncStreamHandler):
                         })
                     )
 
+                    # Camera vision: send image as multimodal content so Claude can see it
+                    if isinstance(result, dict) and "b64_im" in result:
+                        image_question = parsed_input.get("question", "What do you see?")
+                        tool_content = [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/jpeg",
+                                    "data": result["b64_im"],
+                                },
+                            },
+                            {"type": "text", "text": image_question},
+                        ]
+                    else:
+                        tool_content = _json.dumps(result)
+
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": tu["id"],
-                        "content": _json.dumps(result),
+                        "content": tool_content,
                     })
 
                 # Send tool results back to Claude
@@ -1012,9 +1074,13 @@ class ClaudePipelineHandler(AsyncStreamHandler):
             except asyncio.TimeoutError:
                 continue
             if item is None:
+                self._tts_queue.task_done()
                 break  # Shutdown sentinel
             text, speed = item
-            await self._tts_and_emit(text, speed)
+            try:
+                await self._tts_and_emit(text, speed)
+            finally:
+                self._tts_queue.task_done()
 
     def _enqueue_tts(self, text: str, speed: float = 1.0) -> None:
         """Enqueue a sentence for sequential TTS playback (non-blocking)."""
@@ -1051,13 +1117,19 @@ class ClaudePipelineHandler(AsyncStreamHandler):
                 )
 
             # Push PCM in ~200ms chunks for smooth streaming output
+            self._tts_active = True
             chunk_samples = SAMPLE_RATE // 5  # 3200 samples = 200ms
             for i in range(0, len(pcm_array), chunk_samples):
                 if self._barge_in_event.is_set():
                     break
                 chunk = pcm_array[i : i + chunk_samples]
                 await self.output_queue.put((SAMPLE_RATE, chunk))
-                self._last_audio_data_time = _time.time()
+                now = _time.time()
+                self._last_audio_data_time = now
+                self._last_tts_emit_time = now  # stamp for echo guard
+            # Keep echo suppression active for 500ms after last chunk (speaker tail)
+            await asyncio.sleep(0.5)
+            self._tts_active = False
 
             logger.warning("TTS[%s] emitted: %d samples for '%s'", tts_provider, len(pcm_array), text[:30])
 
