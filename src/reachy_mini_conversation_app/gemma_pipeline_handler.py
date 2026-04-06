@@ -16,6 +16,7 @@ Requires: openai (for Ollama OpenAI-compatible API), Ollama running with gemma4 
 
 from __future__ import annotations
 
+import json
 import os
 import asyncio
 import logging
@@ -86,25 +87,28 @@ class GemmaPipelineHandler(ClaudePipelineHandler):
             logger.error("No GROQ_API_KEY or OPENAI_API_KEY for Whisper STT.")
             return
 
-        # --- Ollama LLM client (OpenAI-compatible API) ---
-        self._ollama_client = AsyncOpenAI(
-            api_key="ollama",  # Ollama doesn't check this, but the client requires it
-            base_url=OLLAMA_BASE_URL,
-        )
+        # --- Ollama native API (supports think:false, unlike /v1 compat) ---
+        # Strip /v1 suffix to get base Ollama URL
+        self._ollama_base = OLLAMA_BASE_URL.rstrip("/")
+        if self._ollama_base.endswith("/v1"):
+            self._ollama_base = self._ollama_base[:-3]
 
         # Verify Ollama is reachable
         try:
-            models = await self._ollama_client.models.list()
-            model_names = [m.id for m in models.data]
-            if OLLAMA_MODEL not in model_names:
-                logger.warning(
-                    "Model %s not found in Ollama. Available: %s",
-                    OLLAMA_MODEL, model_names,
-                )
-            else:
-                logger.info("Ollama model verified: %s", OLLAMA_MODEL)
+            import httpx
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(f"{self._ollama_base}/api/tags")
+                resp.raise_for_status()
+                model_names = [m["name"] for m in resp.json().get("models", [])]
+                if OLLAMA_MODEL not in model_names:
+                    logger.warning(
+                        "Model %s not found in Ollama. Available: %s",
+                        OLLAMA_MODEL, model_names,
+                    )
+                else:
+                    logger.info("Ollama model verified: %s", OLLAMA_MODEL)
         except Exception as e:
-            logger.error("Cannot reach Ollama at %s: %s", OLLAMA_BASE_URL, e)
+            logger.error("Cannot reach Ollama at %s: %s", self._ollama_base, e)
             return
 
         # TTS voice
@@ -172,45 +176,54 @@ class GemmaPipelineHandler(ClaudePipelineHandler):
         text_buffer = ""
 
         try:
-            stream = await self._ollama_client.chat.completions.create(
-                model=OLLAMA_MODEL,
-                messages=api_messages,
-                max_tokens=OLLAMA_MAX_TOKENS,
-                temperature=0.7,
-                stream=True,
-                extra_body={"think": False},  # Disable thinking for low latency
-            )
+            import httpx
 
-            async for chunk in stream:
-                if self._barge_in_event.is_set():
-                    logger.warning("Barge-in during streaming, breaking")
-                    break
+            payload = {
+                "model": OLLAMA_MODEL,
+                "messages": api_messages,
+                "stream": True,
+                "think": False,
+                "options": {"num_predict": OLLAMA_MAX_TOKENS, "temperature": 0.7},
+            }
 
-                delta = chunk.choices[0].delta if chunk.choices else None
-                if delta and delta.content:
-                    text_buffer += delta.content
-
-                    # Flush complete sentences for immediate TTS
-                    while True:
-                        split_idx = -1
-                        for i, ch in enumerate(text_buffer):
-                            if ch in SENTENCE_ENDINGS:
-                                split_idx = i
-                                break
-                        if split_idx < 0:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                async with client.stream(
+                    "POST", f"{self._ollama_base}/api/chat", json=payload
+                ) as resp:
+                    resp.raise_for_status()
+                    async for line in resp.aiter_lines():
+                        if not line:
+                            continue
+                        if self._barge_in_event.is_set():
+                            logger.warning("Barge-in during streaming, breaking")
                             break
-                        sentence = text_buffer[:split_idx + 1].strip()
-                        text_buffer = text_buffer[split_idx + 1:]
-                        if sentence:
-                            sentence, emotion = self._parse_emotion(sentence)
-                            if not sentence:
-                                continue
-                            tts_speed = EMOTION_TTS_SPEED.get(emotion, 1.0)
-                            full_response += sentence
-                            await self.output_queue.put(
-                                AdditionalOutputs({"role": "assistant", "content": sentence})
-                            )
-                            self._enqueue_tts(sentence, tts_speed)
+
+                        chunk = json.loads(line)
+                        content = chunk.get("message", {}).get("content", "")
+                        if content:
+                            text_buffer += content
+
+                            # Flush complete sentences for immediate TTS
+                            while True:
+                                split_idx = -1
+                                for i, ch in enumerate(text_buffer):
+                                    if ch in SENTENCE_ENDINGS:
+                                        split_idx = i
+                                        break
+                                if split_idx < 0:
+                                    break
+                                sentence = text_buffer[:split_idx + 1].strip()
+                                text_buffer = text_buffer[split_idx + 1:]
+                                if sentence:
+                                    sentence, emotion = self._parse_emotion(sentence)
+                                    if not sentence:
+                                        continue
+                                    tts_speed = EMOTION_TTS_SPEED.get(emotion, 1.0)
+                                    full_response += sentence
+                                    await self.output_queue.put(
+                                        AdditionalOutputs({"role": "assistant", "content": sentence})
+                                    )
+                                    self._enqueue_tts(sentence, tts_speed)
 
             # Flush remaining buffer
             if text_buffer.strip():
