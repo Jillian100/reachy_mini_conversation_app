@@ -73,8 +73,8 @@ class LocalStream:
         # Half-duplex echo prevention: mute mic while speaker is active
         self._speaker_active: bool = False
         self._speaker_end_time: float = 0.0  # monotonic timestamp
-        self._SPEAKER_TAIL_GUARD: float = 0.5  # seconds to keep mic muted after TTS ends
-        self._BARGE_IN_RMS: float = 0.10  # normal speech volume breaks through — robot yields
+        self._SPEAKER_TAIL_GUARD: float = float(os.environ.get("SPEAKER_TAIL_GUARD", "2.0"))
+        self._BARGE_IN_RMS: float = float(os.environ.get("BARGE_IN_RMS", "0.80"))
 
     # ---- Settings UI (only when API key is missing) ----
     def _read_env_lines(self, env_path: Path) -> list[str]:

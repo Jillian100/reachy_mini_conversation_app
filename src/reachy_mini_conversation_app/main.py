@@ -103,7 +103,7 @@ def run(
             args.head_tracker = env_tracker
 
     # Backend selection: "openai" (default), "gemini", or "claude"
-    # [MODIFIED] Default to "gemini" for Amelie
+    # [MODIFIED] Default to "gemini" for Vicky
     conversation_backend = os.environ.get("CONVERSATION_BACKEND", "gemini").lower()
     if conversation_backend == "gemini":
         from reachy_mini_conversation_app.gemini_live_handler import GeminiLiveHandler as ConversationHandler

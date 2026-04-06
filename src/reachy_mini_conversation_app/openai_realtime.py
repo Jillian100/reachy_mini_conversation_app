@@ -13,7 +13,7 @@ import gradio as gr
 from openai import AsyncOpenAI
 from fastrtc import AdditionalOutputs, AsyncStreamHandler, wait_for_item, audio_to_int16
 from numpy.typing import NDArray
-from scipy.signal import resample
+from scipy.signal import resample, resample as scipy_resample
 from websockets.exceptions import ConnectionClosedError
 
 from reachy_mini_conversation_app.config import config
@@ -40,6 +40,10 @@ OPENAI_SPEECH_BAND_RATIO: Final[float] = float(os.environ.get("OPENAI_SPEECH_BAN
 
 OPEN_AI_INPUT_SAMPLE_RATE: Final[Literal[24000]] = 24000
 OPEN_AI_OUTPUT_SAMPLE_RATE: Final[Literal[24000]] = 24000
+ROBOT_NATIVE_SAMPLE_RATE: Final[int] = 16000  # Robot speaker native rate
+
+# Volume gain for OpenAI audio output (API tends to output quieter audio)
+OPENAI_VOLUME_GAIN: Final[float] = float(os.environ.get("OPENAI_VOLUME_GAIN", "2.0"))
 
 
 class OpenaiRealtimeHandler(AsyncStreamHandler):
@@ -49,19 +53,13 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         """Initialize the handler."""
         super().__init__(
             expected_layout="mono",
-            output_sample_rate=OPEN_AI_OUTPUT_SAMPLE_RATE,
+            output_sample_rate=ROBOT_NATIVE_SAMPLE_RATE,  # Output at 16kHz (robot native)
             input_sample_rate=OPEN_AI_INPUT_SAMPLE_RATE,
         )
 
-        # Override typing of the sample rates to match OpenAI's requirements
-        self.output_sample_rate: Literal[24000] = self.output_sample_rate
-        self.input_sample_rate: Literal[24000] = self.input_sample_rate
-
         self.deps = deps
-
-        # Override type annotations for OpenAI strict typing (only for values used in API)
-        self.output_sample_rate = OPEN_AI_OUTPUT_SAMPLE_RATE
-        self.input_sample_rate = OPEN_AI_INPUT_SAMPLE_RATE
+        self.gradio_mode = gradio_mode
+        self.instance_path = instance_path
 
         self.connection: Any = None
         self.output_queue: "asyncio.Queue[Tuple[int, NDArray[np.int16]] | AdditionalOutputs]" = asyncio.Queue()
@@ -69,8 +67,6 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self.last_activity_time = asyncio.get_event_loop().time()
         self.start_time = asyncio.get_event_loop().time()
         self.is_idle_tool_call = False
-        self.gradio_mode = gradio_mode
-        self.instance_path = instance_path
         # Track how the API key was provided (env vs textbox) and its value
         self._key_source: Literal["env", "textbox"] = "env"
         self._provided_api_key: str | None = None
@@ -95,6 +91,10 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self._prebuffer: deque[str] = deque(
             maxlen=max(1, int(OPENAI_ENERGY_PREBUFFER / 0.02))
         )
+
+        # Audio buffer for resampling (accumulate small OpenAI chunks before output)
+        self._audio_buffer = bytearray()
+        self._output_sr = ROBOT_NATIVE_SAMPLE_RATE  # 16000
 
     def copy(self) -> "OpenaiRealtimeHandler":
         """Create a copy of the handler."""
@@ -264,7 +264,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                             "input": {
                                 "format": {
                                     "type": "audio/pcm",
-                                    "rate": self.input_sample_rate,
+                                    "rate": OPEN_AI_INPUT_SAMPLE_RATE,
                                 },
                                 "transcription": {"model": "gpt-4o-transcribe"},
                                 "turn_detection": {
@@ -275,7 +275,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                             "output": {
                                 "format": {
                                     "type": "audio/pcm",
-                                    "rate": self.output_sample_rate,
+                                    "rate": OPEN_AI_OUTPUT_SAMPLE_RATE,
                                 },
                                 "voice": get_session_voice(),
                             },
@@ -308,6 +308,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 logger.debug(f"OpenAI event: {event.type}")
                 if event.type == "input_audio_buffer.speech_started":
                     self._model_speaking = False  # User barge-in: stop echo suppression
+                    self._audio_buffer.clear()  # Discard buffered audio on barge-in
                     if hasattr(self, "_clear_queue") and callable(self._clear_queue):
                         self._clear_queue()
                     if self.deps.head_wobbler is not None:
@@ -326,6 +327,9 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     "response.audio.completed",  # legacy (for safety)
                     "response.completed",  # text-only completion
                 ):
+                    # Flush remaining audio buffer before marking done
+                    if self._audio_buffer:
+                        await self._flush_audio_buffer()
                     self._model_speaking = False
                     logger.debug("response completed")
 
@@ -384,12 +388,12 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                         self.deps.head_wobbler.feed(event.delta)
                     self.last_activity_time = asyncio.get_event_loop().time()
                     logger.debug("last activity time updated to %s", self.last_activity_time)
-                    await self.output_queue.put(
-                        (
-                            self.output_sample_rate,
-                            np.frombuffer(base64.b64decode(event.delta), dtype=np.int16).reshape(1, -1),
-                        ),
-                    )
+                    # Buffer small chunks, then resample as a batch to avoid
+                    # per-chunk resampling artifacts (OpenAI sends ~40ms chunks at 24kHz)
+                    self._audio_buffer.extend(base64.b64decode(event.delta))
+                    # Flush when we have >= 200ms of audio (4800 samples @ 24kHz, 16-bit)
+                    if len(self._audio_buffer) >= 4800 * 2:
+                        await self._flush_audio_buffer()
 
                 # ---- tool-calling plumbing ----
                 if event.type == "response.function_call_arguments.done":
@@ -495,6 +499,32 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                         await self.output_queue.put(
                             AdditionalOutputs({"role": "assistant", "content": f"[error] {msg}"})
                         )
+
+    # ------------------------------------------------------------------ #
+    #  Audio buffer flush: resample 24kHz → 16kHz in batch
+    # ------------------------------------------------------------------ #
+    async def _flush_audio_buffer(self) -> None:
+        """Resample buffered 24kHz audio to 16kHz and push to output queue."""
+        if not self._audio_buffer:
+            return
+
+        raw = bytes(self._audio_buffer)
+        self._audio_buffer.clear()
+
+        audio_24k = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+
+        # Apply volume gain
+        if OPENAI_VOLUME_GAIN != 1.0:
+            audio_24k = audio_24k * OPENAI_VOLUME_GAIN
+
+        # Resample 24kHz → 16kHz in one batch (avoids per-chunk artifacts)
+        num_samples_16k = int(len(audio_24k) * self._output_sr / OPEN_AI_OUTPUT_SAMPLE_RATE)
+        audio_16k = scipy_resample(audio_24k, num_samples_16k)
+
+        # Clip and convert back to int16
+        audio_out = np.clip(audio_16k, -32768, 32767).astype(np.int16)
+
+        await self.output_queue.put((self._output_sr, audio_out))
 
     # Microphone receive
     async def receive(self, frame: Tuple[int, NDArray[np.int16]]) -> None:

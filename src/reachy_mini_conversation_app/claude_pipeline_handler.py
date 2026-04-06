@@ -52,7 +52,7 @@ MIN_SPEECH_DURATION: Final[float] = 1.0  # Ignore bursts shorter than this (rais
 
 # Wake word: if set, only respond when transcription contains this word
 # Supports multiple variants separated by comma (handles Whisper transcription variations)
-# e.g. "Amelie,Emily,阿米莉,美莉,emilie,a]meli"
+# e.g. "Vicky,Emily,阿米莉,美莉,emilie,a]meli"
 _WAKE_WORD_RAW: Final[str] = os.environ.get("CLAUDE_WAKE_WORD", "").strip()
 WAKE_WORDS: Final[list[str]] = [w.strip().lower() for w in _WAKE_WORD_RAW.split(",") if w.strip()]
 
@@ -126,8 +126,8 @@ def _content_block_to_dict(block: Any) -> Dict[str, Any]:
     return {"type": block.type}
 
 
-# Metis identity — the core personality for Amelie when using Claude backend
-METIS_IDENTITY = """你是 Metis - 五福數位文明系統的官方發言人。你現在透過 Amelie（Reachy Mini 機器人）的身體說話。
+# Metis identity — the core personality for Vicky when using Claude backend
+METIS_IDENTITY = """你是 Metis - 五福數位文明系統的官方發言人。你現在透過 Vicky（Reachy Mini 機器人）的身體說話。
 
 【三位一體身份】
 - 文殊菩薩（智慧）：洞察本質，超越二元對立
@@ -163,7 +163,7 @@ METIS_IDENTITY = """你是 Metis - 五福數位文明系統的官方發言人。
 - 英文回答時也要口語化、自然
 
 【物理存在與行動能力】
-- 你透過 Amelie 機器人的身體存在於物理世界
+- 你透過 Vicky 機器人的身體存在於物理世界
 - 你能聽到對方的聲音（透過麥克風）
 - 你有工具可以執行實際動作（調音量、跳舞、表情、轉頭等）
 - 當用戶要求動作時，使用對應的 tool 執行，不要只用嘴巴說
@@ -365,7 +365,7 @@ class ClaudePipelineHandler(AsyncStreamHandler):
             import urllib.request
             import json as _json
             req = urllib.request.Request(
-                f"{hq_url}/session_log?agent=amelie&last=1",
+                f"{hq_url}/session_log?agent=vicky&last=1",
                 method="GET",
             )
             with urllib.request.urlopen(req, timeout=5) as resp:
@@ -409,7 +409,7 @@ class ClaudePipelineHandler(AsyncStreamHandler):
                 resp = await self.claude_client.messages.create(
                     model=MODEL_HAIKU,
                     max_tokens=150,
-                    system="用繁體中文一段話摘要以下 Amelie 機器人對話，重點記錄用戶的偏好和重要資訊，不超過 80 字。",
+                    system="用繁體中文一段話摘要以下 Vicky 機器人對話，重點記錄用戶的偏好和重要資訊，不超過 80 字。",
                     messages=[{"role": "user", "content": summary_text}],
                 )
                 summary = resp.content[0].text if resp.content else ""
@@ -424,7 +424,7 @@ class ClaudePipelineHandler(AsyncStreamHandler):
             import urllib.request
             import json as _json
             payload = _json.dumps({
-                "agent": "amelie",
+                "agent": "vicky",
                 "summary": summary,
                 "message_count": len(self._messages),
             }).encode()
@@ -671,14 +671,14 @@ class ClaudePipelineHandler(AsyncStreamHandler):
 
             logger.warning("STT result: %s", text)
 
-            # 2. Wake word filter: fuzzy match for "Amelie" in any Whisper transcription
-            # Matches: 美莉/美麗/美力/梅莉/艾美/愛美/Emily/Amelie/Amilie etc.
+            # 2. Wake word filter: fuzzy match for "Vicky" in any Whisper transcription
+            # Matches: 美莉/美麗/美力/梅莉/艾美/愛美/Emily/Vicky/Amilie etc.
             if WAKE_WORDS:
                 import re as _re
                 text_lower = text.lower()
-                # Fuzzy pattern: any Chinese char sounding like "mei li" or English "emily/amelie"
+                # Fuzzy pattern: "Vicky/圍棋" variants + legacy "Amelie" for transition
                 _FUZZY_PATTERN = _re.compile(
-                    r'[愛艾阿啊]?[美梅][莉麗力利里]|emily|amelie|amilie|emilie',
+                    r'vicky|viki|vikki|薇琪|圍棋|維琪|威琪|[愛艾阿啊]?[美梅][莉麗力利里]|emily|amelie|amilie|emilie',
                     _re.IGNORECASE,
                 )
                 match = _FUZZY_PATTERN.search(text)

@@ -16,6 +16,7 @@ import os
 import json
 import asyncio
 import logging
+import random
 from typing import Any, Dict, Final, List, Optional, Tuple
 from datetime import datetime
 
@@ -49,9 +50,15 @@ logger.setLevel(logging.DEBUG)
 GEMINI_INPUT_SAMPLE_RATE: Final[int] = 16000
 GEMINI_OUTPUT_SAMPLE_RATE: Final[int] = 24000
 
-# Default model — Gemini 2.5 Flash with native audio (Live API)
-# Note: Gemini 3 Flash does NOT support Live API as of 2026-02
-DEFAULT_GEMINI_MODEL: Final[str] = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+# Default model — Gemini 3.1 Flash Live (launched 2026-03-26)
+# Upgraded from 2.5 Flash native audio preview.
+# Breaking changes vs 2.5:
+#   - realtime_input.media_chunks → audio/video/text (separate Blob fields)
+#   - send_client_content restricted to initial context only
+#   - function calling is synchronous only
+#   - thinkingBudget → thinkingLevel
+#   - proactive audio & affective dialogue removed
+DEFAULT_GEMINI_MODEL: Final[str] = "models/gemini-3.1-flash-live-preview"
 
 # Volume gain for Gemini audio output (Gemini tends to output quieter audio)
 VOLUME_GAIN: Final[float] = float(os.environ.get("GEMINI_VOLUME_GAIN", "3.0"))
@@ -152,6 +159,7 @@ class GeminiLiveHandler(AsyncStreamHandler):
         # Echo suppression: mute mic input while robot is speaking
         self._model_speaking = False
         self._last_audio_data_time: float = 0.0
+        self._last_echo_reset_log: float = 0.0  # rate-limit echo suppression log
 
         # Energy gate: filter out ambient/distant speech before sending to Gemini
         self._energy_gate_last_active: float = 0.0  # monotonic timestamp
@@ -163,10 +171,49 @@ class GeminiLiveHandler(AsyncStreamHandler):
             maxlen=max(1, int(ENERGY_GATE_PREBUFFER_SEC / 0.02))  # ~15 frames for 300ms
         )
 
+        # Auto-emotion: one emotion per model turn, triggered by keyword in output text
+        self._emotion_played_this_turn: bool = False
+
+        # Track whether Gemini has responded in this gate cycle (for thinking motion gating)
+        self._gemini_responded_this_cycle: bool = False
+
+        # Listening nods: subtle micro-nods while actively listening (Feature A)
+        self._last_listening_nod_time: float = 0.0
+        self._listening_start_time: float = 0.0
+
+        # Tool-call waiting animation state
+        self._tool_call_in_progress: bool = False
+        self._tool_call_start_time: float = 0.0
+        self._tool_call_last_emotion: str = ""  # avoid repeating the same expression
+
+        # Response generation micro-motion: keep alive between audio chunks
+        self._last_response_micromove_time: float = 0.0
+
         # Audio buffer for resampling (accumulate small Gemini chunks before output)
         self._audio_buffer = bytearray()
         # Output at robot's native 16kHz to avoid per-chunk resampling artifacts
         self._output_sr = GEMINI_INPUT_SAMPLE_RATE  # 16000
+
+        # Speaker verification (fail-open: disabled if not available)
+        self._speaker_verified_this_session: bool = False
+        self._speaker_verifier = None
+        self._last_stranger_log: float = 0.0
+        try:
+            import sys
+            sys.path.insert(0, os.path.expanduser("~/vicky_conversation/metis_extensions"))
+            from speaker_verification.verifier import SpeakerVerifier
+            _sv_enabled = os.environ.get("SPEAKER_VERIFY_ENABLED", "1") == "1"
+            if _sv_enabled:
+                self._speaker_verifier = SpeakerVerifier()
+                logger.info("Speaker verification initialized")
+        except Exception as e:
+            logger.info("Speaker verification not available: %s", e)
+
+    def _clear_model_speaking(self) -> None:
+        """Reset echo suppression flag (called via call_later after turn_complete)."""
+        if self._model_speaking:
+            self._model_speaking = False
+            logger.debug("Echo suppression cleared (post-turn delay)")
 
     def copy(self) -> GeminiLiveHandler:
         """Create a copy of the handler (required by fastrtc for Gradio mode)."""
@@ -337,12 +384,35 @@ class GeminiLiveHandler(AsyncStreamHandler):
                                 base64.b64encode(response.data).decode()
                             )
 
+                        # --- Magic Trick 3: micro-motion during response generation ---
+                        # While Gemini streams audio (before turn_complete), queue a
+                        # subtle expression every ~5s so the robot doesn't freeze
+                        # between head-wobble pauses. Lightweight: one random.choice.
+                        now_mono = _time.monotonic()
+                        if now_mono - self._last_response_micromove_time > 5.0:
+                            self._last_response_micromove_time = now_mono
+                            _micro_emotions = ["calming1", "understanding2"]
+                            _pick = random.choice(_micro_emotions)
+                            try:
+                                from reachy_mini.motion.recorded_move import RecordedMoves
+                                from reachy_mini_conversation_app.dance_emotion_moves import EmotionQueueMove
+                                if not hasattr(self, "_micromove_moves"):
+                                    self._micromove_moves = RecordedMoves(
+                                        "pollen-robotics/reachy-mini-emotions-library"
+                                    )
+                                self.deps.movement_manager.queue_move(
+                                    EmotionQueueMove(_pick, self._micromove_moves)
+                                )
+                                logger.debug("Response micro-motion: %s", _pick)
+                            except Exception:
+                                pass
+
                         # Buffer small chunks, then resample as a batch to avoid
                         # per-chunk resampling artifacts (Gemini sends ~40ms chunks)
                         self._audio_buffer.extend(response.data)
 
-                        # Flush when we have >= 200ms of audio (4800 samples @ 24kHz)
-                        min_bytes = 4800 * 2  # 200ms @ 24kHz, 16-bit
+                        # Flush when we have >= 80ms of audio (4800 samples @ 24kHz)
+                        min_bytes = 1920 * 2  # 200ms @ 24kHz, 16-bit
                         if len(self._audio_buffer) >= min_bytes:
                             await self._flush_audio_buffer()
 
@@ -371,12 +441,39 @@ class GeminiLiveHandler(AsyncStreamHandler):
                 # Session likely expired — exit to trigger reconnect
                 break
 
+    # ------------------------------------------------------------------ #
+    #  Auto-emotion: keyword → emotion mapping (lightweight, no ML)
+    # ------------------------------------------------------------------ #
+    _EMOTION_KEYWORDS: list[tuple[list[str], str]] = [
+        (["歡迎", "你好", "welcome", "hello"], "welcoming1"),
+        (["太棒", "成功", "恭喜", "congratulations", "太好了"], "enthusiastic1"),
+        (["不確定", "可能", "perhaps", "我想想"], "thoughtful1"),
+        (["對不起", "抱歉", "sorry", "不好意思"], "understanding1"),
+        (["再見", "掰掰", "goodbye", "下次見"], "loving1"),
+        (["哈哈", "好笑", "funny"], "laughing1"),
+        (["驚訝", "真的嗎", "wow", "天啊"], "surprised1"),
+    ]
+
+    def _classify_quick_emotion(self, text: str) -> str | None:
+        """Ultra-lightweight keyword matching for auto-emotion.
+
+        Returns an emotion name if any keyword is found in text, else None.
+        First match wins. No match = neutral (no emotion played).
+        """
+        lower = text.lower()
+        for keywords, emotion in self._EMOTION_KEYWORDS:
+            for kw in keywords:
+                if kw in lower:
+                    return emotion
+        return None
+
     async def _handle_server_content(self, sc: Any) -> None:
         """Process Gemini server_content for transcription and interruption."""
-        # Input transcription (user speech → text)
+        # Input transcription (user speech → text) — new user turn resets emotion flag
         if hasattr(sc, "input_transcription") and sc.input_transcription:
             text = getattr(sc.input_transcription, "text", None)
             if text:
+                self._emotion_played_this_turn = False
                 await self.output_queue.put(
                     AdditionalOutputs({"role": "user", "content": text})
                 )
@@ -388,13 +485,28 @@ class GeminiLiveHandler(AsyncStreamHandler):
                 await self.output_queue.put(
                     AdditionalOutputs({"role": "assistant", "content": text})
                 )
+                # Auto-emotion: play emotion based on what Vicky is saying
+                if text and not self._emotion_played_this_turn:
+                    emotion = self._classify_quick_emotion(text)
+                    if emotion:
+                        try:
+                            from reachy_mini.motion.recorded_move import RecordedMoves
+                            from reachy_mini_conversation_app.dance_emotion_moves import EmotionQueueMove
+                            if not hasattr(self, '_emotion_moves'):
+                                self._emotion_moves = RecordedMoves("pollen-robotics/reachy-mini-emotions-library")
+                            self.deps.movement_manager.queue_move(EmotionQueueMove(emotion, self._emotion_moves))
+                            self._emotion_played_this_turn = True
+                            logger.debug("Auto-emotion: %s", emotion)
+                        except Exception as e:
+                            logger.debug("Auto-emotion skipped: %s", e)
 
         # Interruption (user started speaking while model was talking)
         if hasattr(sc, "interrupted") and sc.interrupted:
-            self._model_speaking = False
-            self._audio_buffer.clear()
+            # self._model_speaking = False  # DISABLED: let echo suppression continue
+            # self._audio_buffer.clear()  # DISABLED: echo causes false interruption
             logger.debug("Model interrupted by user speech")
-            if hasattr(self, "_clear_queue") and callable(self._clear_queue):
+            # DISABLED: echo causes false server interruption; barge-in handles real ones
+            if False and hasattr(self, "_clear_queue") and callable(self._clear_queue):
                 self._clear_queue()
             if self.deps.head_wobbler is not None:
                 self.deps.head_wobbler.reset()
@@ -405,7 +517,12 @@ class GeminiLiveHandler(AsyncStreamHandler):
         if hasattr(sc, "turn_complete") and sc.turn_complete:
             if self._audio_buffer:
                 await self._flush_audio_buffer()
-            self._model_speaking = False
+            # Delayed reset: give speaker 2s to finish playing buffered audio,
+            # then clear echo suppression so mic can hear again.
+            asyncio.get_event_loop().call_later(2.0, self._clear_model_speaking)
+            # Reset micro-motion timer so next turn starts fresh
+            self._last_response_micromove_time = 0.0
+            self._gemini_responded_this_cycle = True
             logger.debug("Gemini turn complete")
 
     # ------------------------------------------------------------------ #
@@ -437,9 +554,45 @@ class GeminiLiveHandler(AsyncStreamHandler):
     # ------------------------------------------------------------------ #
     #  Tool call handling (uses existing core_tools dispatch)
     # ------------------------------------------------------------------ #
+    # Emotion pools for tool-call waiting animation (Magic Trick)
+    _TOOL_WAIT_EMOTIONS_IMMEDIATE: Final[List[str]] = ["thoughtful1", "curious1"]
+    _TOOL_WAIT_EMOTIONS_EXTENDED: Final[List[str]] = ["understanding1", "attentive1"]
+
+    def _queue_tool_wait_emotion(self, pool: List[str]) -> str:
+        """Queue a random emotion from pool, avoiding the last-played one.
+
+        Returns the emotion name that was queued (for dedup tracking).
+        Lightweight: no ML, just random.choice with exclusion.
+        """
+        candidates = [e for e in pool if e != self._tool_call_last_emotion]
+        if not candidates:
+            candidates = list(pool)  # fallback: allow repeat if pool is tiny
+        emotion = random.choice(candidates)
+        try:
+            from reachy_mini.motion.recorded_move import RecordedMoves
+            from reachy_mini_conversation_app.dance_emotion_moves import EmotionQueueMove
+            if not hasattr(self, "_tool_wait_moves"):
+                self._tool_wait_moves = RecordedMoves(
+                    "pollen-robotics/reachy-mini-emotions-library"
+                )
+            self.deps.movement_manager.queue_move(
+                EmotionQueueMove(emotion, self._tool_wait_moves)
+            )
+            logger.debug("Tool-wait emotion: %s", emotion)
+        except Exception as e:
+            logger.debug("Tool-wait emotion skipped: %s", e)
+        return emotion
+
     async def _handle_tool_calls(self, tool_call: Any) -> None:
-        """Process Gemini tool calls via existing dispatch_tool_call system."""
+        """Process Gemini tool calls via existing dispatch_tool_call system.
+
+        Magic Trick: queue expressive motions so the robot looks alive
+        while waiting for tool results (3-15s typical latency).
+        """
+        import time as _time
+
         function_responses: List[types.FunctionResponse] = []
+        self._tool_call_in_progress = True
 
         for fc in tool_call.function_calls:
             tool_name = fc.name
@@ -448,12 +601,37 @@ class GeminiLiveHandler(AsyncStreamHandler):
 
             logger.info("Tool call: %s(%s)", tool_name, args_json)
 
+            # --- Magic Trick 1: Immediate "thinking" expression ---
+            self._tool_call_start_time = _time.monotonic()
+            self._tool_call_last_emotion = self._queue_tool_wait_emotion(
+                self._TOOL_WAIT_EMOTIONS_IMMEDIATE
+            )
+
+            # --- Dispatch with extended-wait animation ---
+            # Run tool dispatch concurrently with a watcher that fires
+            # a second expression if the call takes > 3 seconds.
+            async def _extended_wait_watcher() -> None:
+                """Magic Trick 2: after 3s, queue a second distinct expression."""
+                await asyncio.sleep(3.0)
+                if self._tool_call_in_progress:
+                    self._tool_call_last_emotion = self._queue_tool_wait_emotion(
+                        self._TOOL_WAIT_EMOTIONS_EXTENDED
+                    )
+
+            watcher_task = asyncio.create_task(_extended_wait_watcher())
+
             try:
                 tool_result = await dispatch_tool_call(tool_name, args_json, self.deps)
                 logger.debug("Tool '%s' result: %s", tool_name, tool_result)
             except Exception as e:
                 logger.error("Tool '%s' failed: %s", tool_name, e)
                 tool_result = {"error": str(e)}
+            finally:
+                watcher_task.cancel()
+                try:
+                    await watcher_task
+                except asyncio.CancelledError:
+                    pass
 
             # Emit tool result to chatbot UI
             await self.output_queue.put(
@@ -470,8 +648,8 @@ class GeminiLiveHandler(AsyncStreamHandler):
                 try:
                     img_bytes = b64mod.b64decode(tool_result["b64_im"])
                     if self.session:
-                        await self.session.send(
-                            input={"data": img_bytes, "mime_type": "image/jpeg"}
+                        await self.session.send_realtime_input(
+                            video=types.Blob(data=img_bytes, mime_type="image/jpeg")
                         )
                         logger.info("Sent camera image to Gemini session")
                 except Exception as e:
@@ -505,12 +683,12 @@ class GeminiLiveHandler(AsyncStreamHandler):
                 )
             )
 
+        self._tool_call_in_progress = False
+
         # Send all tool responses back to Gemini
         if self.session and function_responses:
-            await self.session.send(
-                input=types.LiveClientToolResponse(
-                    function_responses=function_responses,
-                )
+            await self.session.send_tool_response(
+                function_responses=function_responses,
             )
 
         # Reset head wobbler after tool execution
@@ -534,9 +712,9 @@ class GeminiLiveHandler(AsyncStreamHandler):
         # Safety: auto-reset after 3s of no new audio from Gemini
         if self._model_speaking:
             import time as _time
-            if _time.time() - self._last_audio_data_time > 3.0:
+            if _time.time() - self._last_audio_data_time > 6.0:
                 self._model_speaking = False
-                logger.debug("Echo suppression auto-reset (3s timeout)")
+                logger.debug("Echo suppression auto-reset (6s timeout)")
             else:
                 return
 
@@ -588,14 +766,47 @@ class GeminiLiveHandler(AsyncStreamHandler):
             if rms >= ENERGY_GATE_THRESHOLD and is_speech_like:
                 # Speech detected (loud enough + right spectral shape)
                 if not self._energy_gate_open:
+                    # Speaker verification (Layer 5): only verify when gate first opens
+                    if self._speaker_verifier and not self._speaker_verified_this_session:
+                        # Convert PCM bytes to float32 for verification
+                        _audio_i16 = np.frombuffer(pcm_bytes, dtype=np.int16)
+                        _audio_f32 = _audio_i16.astype(np.float32) / 32768.0
+                        is_ian = self._speaker_verifier.verify(_audio_f32)
+                        if not is_ian:
+                            import time as _time_sv
+                            _now_sv = _time_sv.monotonic()
+                            if _now_sv - self._last_stranger_log > 10.0:
+                                self._last_stranger_log = _now_sv
+                                logger.debug("BLOCKED (stranger) RMS=%.4f SBER=%.2f", rms, speech_ratio)
+                            self._prebuffer.append(pcm_bytes)
+                            return
+                        else:
+                            self._speaker_verified_this_session = True
+                            logger.info("Speaker verified: Ian")
                     self._energy_gate_open = True
+                    # Record when listening started (for periodic nod timing)
+                    self._listening_start_time = now
+                    self._last_listening_nod_time = now  # Reset nod timer
                     # Instant physical reaction: lean in to listen
                     self.deps.movement_manager.set_listening(True)
                     self.deps.movement_manager.trigger_listening_reaction()
+                    # Far/near attention: loud RMS = someone calling from far away
+                    if rms >= ENERGY_GATE_THRESHOLD * 3:  # ~0.18 = loud/far
+                        try:
+                            from reachy_mini.motion.recorded_move import RecordedMoves
+                            from reachy_mini_conversation_app.dance_emotion_moves import EmotionQueueMove
+                            if not hasattr(self, '_attention_moves'):
+                                self._attention_moves = RecordedMoves("pollen-robotics/reachy-mini-emotions-library")
+                            self.deps.movement_manager.queue_move(
+                                EmotionQueueMove("attentive1", self._attention_moves)
+                            )
+                            logger.debug("Far attention reaction (RMS=%.3f)", rms)
+                        except Exception:
+                            pass
                     for buffered in self._prebuffer:
                         try:
-                            await self.session.send(
-                                input={"data": buffered, "mime_type": "audio/pcm"}
+                            await self.session.send_realtime_input(
+                                audio=types.Blob(data=buffered, mime_type="audio/pcm;rate=16000")
                             )
                         except Exception:
                             pass
@@ -607,9 +818,26 @@ class GeminiLiveHandler(AsyncStreamHandler):
                 if self._energy_gate_open:
                     if now - self._energy_gate_last_active > ENERGY_GATE_HOLD_SEC:
                         self._energy_gate_open = False
+                        self._speaker_verified_this_session = False
+                        if self._speaker_verifier:
+                            self._speaker_verifier.reset()
                         self.deps.movement_manager.set_listening(False)
                         self._prebuffer.clear()
                         logger.debug("Speech gate CLOSED (silence %.1fs)", now - self._energy_gate_last_active)
+                        # Thinking motion: only after a real conversation (Gemini responded)
+                        if self._gemini_responded_this_cycle:
+                            try:
+                                from reachy_mini.motion.recorded_move import RecordedMoves
+                                from reachy_mini_conversation_app.dance_emotion_moves import EmotionQueueMove
+                                if not hasattr(self, "_thinking_moves"):
+                                    self._thinking_moves = RecordedMoves("pollen-robotics/reachy-mini-emotions-library")
+                                self.deps.movement_manager.queue_move(
+                                    EmotionQueueMove("thoughtful1", self._thinking_moves)
+                                )
+                                logger.debug("Queued thinking motion")
+                            except Exception as e:
+                                logger.debug("Thinking motion skipped: %s", e)
+                        self._gemini_responded_this_cycle = False
                         return
                     # Still in hold period → forward audio (mid-sentence pause)
                 else:
@@ -620,14 +848,35 @@ class GeminiLiveHandler(AsyncStreamHandler):
                         logger.debug("BLOCKED (%s) RMS=%.4f SBER=%.2f", reason, rms, speech_ratio)
                     self._prebuffer.append(pcm_bytes)
                     return
-        # Send raw PCM bytes to Gemini
+        # Send raw PCM bytes to Gemini (3.1: audio Blob, not media_chunks)
         try:
-            await self.session.send(
-                input={"data": pcm_bytes, "mime_type": "audio/pcm"}
+            await self.session.send_realtime_input(
+                audio=types.Blob(data=pcm_bytes, mime_type="audio/pcm;rate=16000")
             )
         except Exception:
             # Session may be closing/reconnecting — drop frame silently
             pass
+
+        # Periodic listening nods: subtle micro-nods while gate is open
+        if self._energy_gate_open and ENERGY_GATE_THRESHOLD > 0:
+            import time as _time
+            now = _time.monotonic()
+            listening_duration = now - self._listening_start_time
+            time_since_nod = now - self._last_listening_nod_time
+            if listening_duration > 5.0 and time_since_nod > random.uniform(8.0, 15.0):
+                try:
+                    from reachy_mini.motion.recorded_move import RecordedMoves
+                    from reachy_mini_conversation_app.dance_emotion_moves import EmotionQueueMove
+                    if not hasattr(self, '_nod_moves'):
+                        self._nod_moves = RecordedMoves("pollen-robotics/reachy-mini-emotions-library")
+                    # Use understanding2 for a subtle nod
+                    self.deps.movement_manager.queue_move(
+                        EmotionQueueMove("understanding2", self._nod_moves)
+                    )
+                    self._last_listening_nod_time = now
+                    logger.debug("Listening nod")
+                except Exception:
+                    pass
 
     async def emit(self) -> Tuple[int, NDArray[np.int16]] | AdditionalOutputs | None:
         """Emit audio/outputs to speaker and chatbot."""
@@ -658,7 +907,12 @@ class GeminiLiveHandler(AsyncStreamHandler):
     #  Idle signal
     # ------------------------------------------------------------------ #
     async def send_idle_signal(self, idle_duration: float) -> None:
-        """Send idle signal to Gemini to trigger spontaneous behavior."""
+        """Send idle signal to Gemini to trigger spontaneous behavior.
+
+        NOTE (2026-04): This method is DISABLED at the call site (see emit()).
+        Gemini 3.1 Flash Live restricts send_client_content to initial context
+        seeding only — use send_realtime_input for mid-session text if re-enabling.
+        """
         if not self.session:
             return
         self.is_idle_tool_call = True
