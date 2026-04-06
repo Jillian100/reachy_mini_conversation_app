@@ -78,6 +78,11 @@ ENERGY_GATE_PREBUFFER_SEC: Final[float] = float(os.environ.get("GEMINI_ENERGY_PR
 # Combined with RMS gate: audio must pass BOTH thresholds to reach Gemini.
 SPEECH_BAND_RATIO_THRESHOLD: Final[float] = float(os.environ.get("GEMINI_SPEECH_BAND_RATIO", "0.5"))
 
+# Conversation mode: two-tier dormant/active energy gate
+ENERGY_GATE_DORMANT: Final[float] = float(os.environ.get("GEMINI_ENERGY_GATE_DORMANT", "0.12"))
+# Seconds of silence before active → dormant transition
+CONVERSATION_ACTIVE_TIMEOUT: Final[float] = float(os.environ.get("CONVERSATION_ACTIVE_TIMEOUT", "30.0"))
+
 # OpenAI voice → Gemini voice mapping
 _OPENAI_TO_GEMINI_VOICE: Dict[str, str] = {
     "coral": "Kore",
@@ -176,6 +181,10 @@ class GeminiLiveHandler(AsyncStreamHandler):
 
         # Track whether Gemini has responded in this gate cycle (for thinking motion gating)
         self._gemini_responded_this_cycle: bool = False
+
+        # Conversation mode: "dormant" (high threshold, no reactions) / "active" (low threshold, reactions)
+        self._conversation_mode: str = "dormant"
+        self._last_gemini_audio_time: float = 0.0
 
         # Listening nods: subtle micro-nods while actively listening (Feature A)
         self._last_listening_nod_time: float = 0.0
@@ -375,6 +384,7 @@ class GeminiLiveHandler(AsyncStreamHandler):
                         import time as _time
                         self._model_speaking = True
                         self._last_audio_data_time = _time.time()
+                        self._last_gemini_audio_time = _time.monotonic()
                         self.last_activity_time = asyncio.get_event_loop().time()
 
                         # Feed head wobbler for audio-reactive motion
@@ -510,8 +520,9 @@ class GeminiLiveHandler(AsyncStreamHandler):
                 self._clear_queue()
             if self.deps.head_wobbler is not None:
                 self.deps.head_wobbler.reset()
-            self.deps.movement_manager.set_listening(True)
-            self.deps.movement_manager.trigger_listening_reaction()
+            if self._conversation_mode == "active":
+                self.deps.movement_manager.set_listening(True)
+                self.deps.movement_manager.trigger_listening_reaction()
 
         # Turn complete — flush remaining audio buffer and re-enable mic
         if hasattr(sc, "turn_complete") and sc.turn_complete:
@@ -523,6 +534,9 @@ class GeminiLiveHandler(AsyncStreamHandler):
             # Reset micro-motion timer so next turn starts fresh
             self._last_response_micromove_time = 0.0
             self._gemini_responded_this_cycle = True
+            if self._conversation_mode == "dormant":
+                self._conversation_mode = "active"
+                logger.info("Conversation mode: DORMANT -> ACTIVE")
             logger.debug("Gemini turn complete")
 
     # ------------------------------------------------------------------ #
@@ -763,46 +777,52 @@ class GeminiLiveHandler(AsyncStreamHandler):
                 speech_ratio = float(np.sum(power[speech_mask])) / total_power
                 is_speech_like = speech_ratio >= SPEECH_BAND_RATIO_THRESHOLD
 
-            if rms >= ENERGY_GATE_THRESHOLD and is_speech_like:
+            # Dynamic threshold based on conversation mode
+            _effective_threshold = (ENERGY_GATE_DORMANT
+                                   if self._conversation_mode == "dormant"
+                                   else ENERGY_GATE_THRESHOLD)
+
+            if rms >= _effective_threshold and is_speech_like:
                 # Speech detected (loud enough + right spectral shape)
                 if not self._energy_gate_open:
-                    # Speaker verification (Layer 5): only verify when gate first opens
+                    # Speaker verification: dormant=fail-close, active=fail-open
+                    _fail_open = (self._conversation_mode == "active")
                     if self._speaker_verifier and not self._speaker_verified_this_session:
-                        # Convert PCM bytes to float32 for verification
                         _audio_i16 = np.frombuffer(pcm_bytes, dtype=np.int16)
                         _audio_f32 = _audio_i16.astype(np.float32) / 32768.0
-                        is_ian = self._speaker_verifier.verify(_audio_f32)
+                        is_ian = self._speaker_verifier.verify(
+                            _audio_f32, fail_open=_fail_open)
                         if not is_ian:
                             import time as _time_sv
                             _now_sv = _time_sv.monotonic()
                             if _now_sv - self._last_stranger_log > 10.0:
                                 self._last_stranger_log = _now_sv
-                                logger.debug("BLOCKED (stranger) RMS=%.4f SBER=%.2f", rms, speech_ratio)
+                                logger.debug("BLOCKED (stranger) RMS=%.4f SBER=%.2f mode=%s",
+                                             rms, speech_ratio, self._conversation_mode)
                             self._prebuffer.append(pcm_bytes)
                             return
                         else:
                             self._speaker_verified_this_session = True
                             logger.info("Speaker verified: Ian")
                     self._energy_gate_open = True
-                    # Record when listening started (for periodic nod timing)
                     self._listening_start_time = now
-                    self._last_listening_nod_time = now  # Reset nod timer
-                    # Instant physical reaction: lean in to listen
-                    self.deps.movement_manager.set_listening(True)
-                    self.deps.movement_manager.trigger_listening_reaction()
-                    # Far/near attention: loud RMS = someone calling from far away
-                    if rms >= ENERGY_GATE_THRESHOLD * 3:  # ~0.18 = loud/far
-                        try:
-                            from reachy_mini.motion.recorded_move import RecordedMoves
-                            from reachy_mini_conversation_app.dance_emotion_moves import EmotionQueueMove
-                            if not hasattr(self, '_attention_moves'):
-                                self._attention_moves = RecordedMoves("pollen-robotics/reachy-mini-emotions-library")
-                            self.deps.movement_manager.queue_move(
-                                EmotionQueueMove("attentive1", self._attention_moves)
-                            )
-                            logger.debug("Far attention reaction (RMS=%.3f)", rms)
-                        except Exception:
-                            pass
+                    self._last_listening_nod_time = now
+                    # Physical reactions only in active mode
+                    if self._conversation_mode == "active":
+                        self.deps.movement_manager.set_listening(True)
+                        self.deps.movement_manager.trigger_listening_reaction()
+                        if rms >= _effective_threshold * 3:
+                            try:
+                                from reachy_mini.motion.recorded_move import RecordedMoves
+                                from reachy_mini_conversation_app.dance_emotion_moves import EmotionQueueMove
+                                if not hasattr(self, '_attention_moves'):
+                                    self._attention_moves = RecordedMoves("pollen-robotics/reachy-mini-emotions-library")
+                                self.deps.movement_manager.queue_move(
+                                    EmotionQueueMove("attentive1", self._attention_moves)
+                                )
+                                logger.debug("Far attention reaction (RMS=%.3f)", rms)
+                            except Exception:
+                                pass
                     for buffered in self._prebuffer:
                         try:
                             await self.session.send_realtime_input(
@@ -811,21 +831,34 @@ class GeminiLiveHandler(AsyncStreamHandler):
                         except Exception:
                             pass
                     self._prebuffer.clear()
-                    logger.debug("Speech gate OPEN (RMS=%.4f, SBER=%.2f)", rms, speech_ratio)
+                    logger.debug("Speech gate OPEN (RMS=%.4f, SBER=%.2f, mode=%s, thr=%.3f)",
+                                 rms, speech_ratio, self._conversation_mode, _effective_threshold)
                 self._energy_gate_last_active = now
             else:
-                # Blocked: too quiet or wrong spectral shape (music/noise)
+                # Blocked: too quiet or wrong spectral shape
                 if self._energy_gate_open:
                     if now - self._energy_gate_last_active > ENERGY_GATE_HOLD_SEC:
                         self._energy_gate_open = False
-                        self._speaker_verified_this_session = False
                         if self._speaker_verifier:
                             self._speaker_verifier.reset()
                         self.deps.movement_manager.set_listening(False)
                         self._prebuffer.clear()
                         logger.debug("Speech gate CLOSED (silence %.1fs)", now - self._energy_gate_last_active)
-                        # Thinking motion: only after a real conversation (Gemini responded)
-                        if self._gemini_responded_this_cycle:
+                        # Active → Dormant check on gate close
+                        if self._conversation_mode == "active":
+                            time_since_gemini = now - self._last_gemini_audio_time
+                            if time_since_gemini >= CONVERSATION_ACTIVE_TIMEOUT:
+                                self._conversation_mode = "dormant"
+                                self._speaker_verified_this_session = False
+                                self._gemini_responded_this_cycle = False
+                                logger.info("Conversation mode: ACTIVE -> DORMANT (%.0fs silence)",
+                                            time_since_gemini)
+                        else:
+                            # Dormant: reset verification on every gate close
+                            self._speaker_verified_this_session = False
+                            self._gemini_responded_this_cycle = False
+                        # Thinking motion: only in active mode after Gemini responded
+                        if self._conversation_mode == "active" and self._gemini_responded_this_cycle:
                             try:
                                 from reachy_mini.motion.recorded_move import RecordedMoves
                                 from reachy_mini_conversation_app.dance_emotion_moves import EmotionQueueMove
@@ -841,11 +874,19 @@ class GeminiLiveHandler(AsyncStreamHandler):
                         return
                     # Still in hold period → forward audio (mid-sentence pause)
                 else:
-                    # Log periodically (every ~5s) to show what's being blocked
+                    # Active → Dormant timeout check (while gate is closed)
+                    if (self._conversation_mode == "active"
+                            and self._last_gemini_audio_time > 0
+                            and now - self._last_gemini_audio_time >= CONVERSATION_ACTIVE_TIMEOUT):
+                        self._conversation_mode = "dormant"
+                        self._speaker_verified_this_session = False
+                        logger.info("Conversation mode: ACTIVE -> DORMANT (timeout while idle)")
+                    # Log periodically (every ~5s)
                     if not hasattr(self, '_last_block_log') or now - self._last_block_log > 5.0:
                         self._last_block_log = now
-                        reason = "quiet" if rms < ENERGY_GATE_THRESHOLD else "music"
-                        logger.debug("BLOCKED (%s) RMS=%.4f SBER=%.2f", reason, rms, speech_ratio)
+                        reason = "quiet" if rms < _effective_threshold else "music"
+                        logger.debug("BLOCKED (%s) RMS=%.4f SBER=%.2f mode=%s",
+                                     reason, rms, speech_ratio, self._conversation_mode)
                     self._prebuffer.append(pcm_bytes)
                     return
         # Send raw PCM bytes to Gemini (3.1: audio Blob, not media_chunks)
@@ -857,8 +898,8 @@ class GeminiLiveHandler(AsyncStreamHandler):
             # Session may be closing/reconnecting — drop frame silently
             pass
 
-        # Periodic listening nods: subtle micro-nods while gate is open
-        if self._energy_gate_open and ENERGY_GATE_THRESHOLD > 0:
+        # Periodic listening nods: only in active mode
+        if self._conversation_mode == "active" and self._energy_gate_open and ENERGY_GATE_THRESHOLD > 0:
             import time as _time
             now = _time.monotonic()
             listening_duration = now - self._listening_start_time
