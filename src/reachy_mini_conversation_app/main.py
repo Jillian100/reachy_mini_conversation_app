@@ -102,13 +102,15 @@ def run(
         if env_tracker in ("yolo", "mediapipe"):
             args.head_tracker = env_tracker
 
-    # Backend selection: "openai" (default), "gemini", or "claude"
+    # Backend selection: "openai" (default), "gemini", "claude", or "gemma"
     # [MODIFIED] Default to "gemini" for Vicky
     conversation_backend = os.environ.get("CONVERSATION_BACKEND", "gemini").lower()
     if conversation_backend == "gemini":
         from reachy_mini_conversation_app.gemini_live_handler import GeminiLiveHandler as ConversationHandler
     elif conversation_backend == "claude":
         from reachy_mini_conversation_app.claude_pipeline_handler import ClaudePipelineHandler as ConversationHandler
+    elif conversation_backend == "gemma":
+        from reachy_mini_conversation_app.gemma_pipeline_handler import GemmaPipelineHandler as ConversationHandler
     else:
         from reachy_mini_conversation_app.openai_realtime import OpenaiRealtimeHandler as ConversationHandler
 

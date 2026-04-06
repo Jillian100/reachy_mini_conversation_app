@@ -80,6 +80,10 @@ SPEECH_BAND_RATIO_THRESHOLD: Final[float] = float(os.environ.get("GEMINI_SPEECH_
 
 # Conversation mode: two-tier dormant/active energy gate
 ENERGY_GATE_DORMANT: Final[float] = float(os.environ.get("GEMINI_ENERGY_GATE_DORMANT", "0.12"))
+# Motion effects: disable all auto-motions (tool-wait, micro-motion, thinking, listening nod)
+# Gemini can still call play_emotion tool explicitly. OFF = quiet body.
+# Motion effects level: 0=all off (guard), 1=minimal (home: nod 30s + auto-emotion), 2=full (host)
+MOTION_EFFECTS_LEVEL: Final[int] = int(os.environ.get("MOTION_EFFECTS", "1"))
 # Seconds of silence before active → dormant transition
 CONVERSATION_ACTIVE_TIMEOUT: Final[float] = float(os.environ.get("CONVERSATION_ACTIVE_TIMEOUT", "30.0"))
 
@@ -186,6 +190,9 @@ class GeminiLiveHandler(AsyncStreamHandler):
         self._conversation_mode: str = "dormant"
         self._last_gemini_audio_time: float = 0.0
 
+        # Music playback: when True, SBER gate is bypassed (music distorts speech ratio)
+        self._music_playing: bool = False
+
         # Listening nods: subtle micro-nods while actively listening (Feature A)
         self._last_listening_nod_time: float = 0.0
         self._listening_start_time: float = 0.0
@@ -211,7 +218,7 @@ class GeminiLiveHandler(AsyncStreamHandler):
             import sys
             sys.path.insert(0, os.path.expanduser("~/vicky_conversation/metis_extensions"))
             from speaker_verification.verifier import SpeakerVerifier
-            _sv_enabled = os.environ.get("SPEAKER_VERIFY_ENABLED", "1") == "1"
+            _sv_enabled = os.environ.get("SPEAKER_VERIFY_ENABLED", "0") == "1"
             if _sv_enabled:
                 self._speaker_verifier = SpeakerVerifier()
                 logger.info("Speaker verification initialized")
@@ -399,7 +406,7 @@ class GeminiLiveHandler(AsyncStreamHandler):
                         # subtle expression every ~5s so the robot doesn't freeze
                         # between head-wobble pauses. Lightweight: one random.choice.
                         now_mono = _time.monotonic()
-                        if now_mono - self._last_response_micromove_time > 5.0:
+                        if MOTION_EFFECTS_LEVEL >= 2 and now_mono - self._last_response_micromove_time > 5.0:
                             self._last_response_micromove_time = now_mono
                             _micro_emotions = ["calming1", "understanding2"]
                             _pick = random.choice(_micro_emotions)
@@ -536,6 +543,8 @@ class GeminiLiveHandler(AsyncStreamHandler):
             self._gemini_responded_this_cycle = True
             if self._conversation_mode == "dormant":
                 self._conversation_mode = "active"
+                import time as _time_tc
+                self._last_gemini_audio_time = _time_tc.monotonic()  # reset so timeout counts from now
                 logger.info("Conversation mode: DORMANT -> ACTIVE")
             logger.debug("Gemini turn complete")
 
@@ -617,9 +626,10 @@ class GeminiLiveHandler(AsyncStreamHandler):
 
             # --- Magic Trick 1: Immediate "thinking" expression ---
             self._tool_call_start_time = _time.monotonic()
-            self._tool_call_last_emotion = self._queue_tool_wait_emotion(
-                self._TOOL_WAIT_EMOTIONS_IMMEDIATE
-            )
+            if MOTION_EFFECTS_LEVEL >= 2:
+                self._tool_call_last_emotion = self._queue_tool_wait_emotion(
+                    self._TOOL_WAIT_EMOTIONS_IMMEDIATE
+                )
 
             # --- Dispatch with extended-wait animation ---
             # Run tool dispatch concurrently with a watcher that fires
@@ -627,7 +637,7 @@ class GeminiLiveHandler(AsyncStreamHandler):
             async def _extended_wait_watcher() -> None:
                 """Magic Trick 2: after 3s, queue a second distinct expression."""
                 await asyncio.sleep(3.0)
-                if self._tool_call_in_progress:
+                if self._tool_call_in_progress and MOTION_EFFECTS_LEVEL >= 2:
                     self._tool_call_last_emotion = self._queue_tool_wait_emotion(
                         self._TOOL_WAIT_EMOTIONS_EXTENDED
                     )
@@ -655,6 +665,16 @@ class GeminiLiveHandler(AsyncStreamHandler):
                     "metadata": {"title": f"Used tool {tool_name}", "status": "done"},
                 })
             )
+
+            # Music playback flag: bypass SBER when music is playing
+            if tool_name == "play_music":
+                status = tool_result.get("status", "")
+                if status == "playing":
+                    self._music_playing = True
+                    logger.info("Music started — SBER gate bypassed")
+                elif status in ("stopped", "not_playing"):
+                    self._music_playing = False
+                    logger.info("Music stopped — SBER gate restored")
 
             # Camera tool: send captured image to Gemini for visual understanding
             if tool_name == "camera" and "b64_im" in tool_result:
@@ -768,14 +788,17 @@ class GeminiLiveHandler(AsyncStreamHandler):
             # Speech band energy ratio via FFT
             speech_ratio = -1.0
             is_speech_like = True  # default pass if SBER disabled
-            if SPEECH_BAND_RATIO_THRESHOLD > 0 and len(audio_f32) >= 256:
+            # Music playing: bypass SBER (music distorts ratio), only use RMS ≥ dormant threshold
+            _sber_threshold = (0.0 if self._music_playing
+                               else SPEECH_BAND_RATIO_THRESHOLD)
+            if _sber_threshold > 0 and len(audio_f32) >= 256:
                 fft = np.fft.rfft(audio_f32)
                 power = np.abs(fft) ** 2
                 freqs = np.fft.rfftfreq(len(audio_f32), 1.0 / GEMINI_INPUT_SAMPLE_RATE)
                 speech_mask = (freqs >= 300) & (freqs <= 3400)
                 total_power = float(np.sum(power)) + 1e-10
                 speech_ratio = float(np.sum(power[speech_mask])) / total_power
-                is_speech_like = speech_ratio >= SPEECH_BAND_RATIO_THRESHOLD
+                is_speech_like = speech_ratio >= _sber_threshold
 
             # Dynamic threshold based on conversation mode
             _effective_threshold = (ENERGY_GATE_DORMANT
@@ -858,7 +881,7 @@ class GeminiLiveHandler(AsyncStreamHandler):
                             self._speaker_verified_this_session = False
                             self._gemini_responded_this_cycle = False
                         # Thinking motion: only in active mode after Gemini responded
-                        if self._conversation_mode == "active" and self._gemini_responded_this_cycle:
+                        if MOTION_EFFECTS_LEVEL >= 2 and self._conversation_mode == "active" and self._gemini_responded_this_cycle:
                             try:
                                 from reachy_mini.motion.recorded_move import RecordedMoves
                                 from reachy_mini_conversation_app.dance_emotion_moves import EmotionQueueMove
@@ -898,13 +921,14 @@ class GeminiLiveHandler(AsyncStreamHandler):
             # Session may be closing/reconnecting — drop frame silently
             pass
 
-        # Periodic listening nods: only in active mode
-        if self._conversation_mode == "active" and self._energy_gate_open and ENERGY_GATE_THRESHOLD > 0:
+        # Periodic listening nods: only in active mode, level 1+=slow(25-35s), level 2=fast(8-15s)
+        if MOTION_EFFECTS_LEVEL >= 1 and self._conversation_mode == "active" and self._energy_gate_open and ENERGY_GATE_THRESHOLD > 0:
             import time as _time
             now = _time.monotonic()
             listening_duration = now - self._listening_start_time
             time_since_nod = now - self._last_listening_nod_time
-            if listening_duration > 5.0 and time_since_nod > random.uniform(8.0, 15.0):
+            _nod_interval = random.uniform(25.0, 35.0) if MOTION_EFFECTS_LEVEL == 1 else random.uniform(8.0, 15.0)
+            if listening_duration > 5.0 and time_since_nod > _nod_interval:
                 try:
                     from reachy_mini.motion.recorded_move import RecordedMoves
                     from reachy_mini_conversation_app.dance_emotion_moves import EmotionQueueMove
