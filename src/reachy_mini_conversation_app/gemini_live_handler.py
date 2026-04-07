@@ -180,8 +180,11 @@ class GeminiLiveHandler(AsyncStreamHandler):
             maxlen=max(1, int(ENERGY_GATE_PREBUFFER_SEC / 0.02))  # ~15 frames for 300ms
         )
 
-        # Auto-emotion: one emotion per model turn, triggered by keyword in output text
+        # Auto-emotion: one emotion per model turn, triggered by keyword in output text.
+        # Deferred to post-turn: emotion is detected during speech but queued only after
+        # turn_complete, preventing motor movement from disrupting audio playback.
         self._emotion_played_this_turn: bool = False
+        self._pending_auto_emotion: str | None = None
 
         # Track whether Gemini has responded in this gate cycle (for thinking motion gating)
         self._gemini_responded_this_cycle: bool = False
@@ -192,6 +195,11 @@ class GeminiLiveHandler(AsyncStreamHandler):
 
         # Music playback: when True, SBER gate is bypassed (music distorts speech ratio)
         self._music_playing: bool = False
+
+        # Post-turn echo window: after model finishes speaking, speaker echo has
+        # SBER ≈ 0.35 (below 0.5 threshold) and gets BLOCKED as "music".
+        # During this window, SBER is bypassed so echo doesn't block real speech.
+        self._post_turn_echo_until: float = 0.0
 
         # Listening nods: subtle micro-nods while actively listening (Feature A)
         self._last_listening_nod_time: float = 0.0
@@ -229,7 +237,27 @@ class GeminiLiveHandler(AsyncStreamHandler):
         """Reset echo suppression flag (called via call_later after turn_complete)."""
         if self._model_speaking:
             self._model_speaking = False
-            logger.debug("Echo suppression cleared (post-turn delay)")
+            # Start post-turn echo window: speaker echo decays over ~3s.
+            # During this window, SBER gate is bypassed so echo (SBER≈0.35)
+            # doesn't block subsequent real speech.
+            import time as _time_cms
+            self._post_turn_echo_until = _time_cms.monotonic() + 3.0
+            logger.debug("Echo suppression cleared (post-turn delay) — echo window 3s")
+
+    def _play_deferred_emotion(self, emotion_name: str) -> None:
+        """Play a deferred auto-emotion after turn_complete + delay.
+
+        Called via call_later to avoid motor movement during audio playback.
+        """
+        try:
+            from reachy_mini.motion.recorded_move import RecordedMoves
+            from reachy_mini_conversation_app.dance_emotion_moves import EmotionQueueMove
+            if not hasattr(self, '_emotion_moves'):
+                self._emotion_moves = RecordedMoves("pollen-robotics/reachy-mini-emotions-library")
+            self.deps.movement_manager.queue_move(EmotionQueueMove(emotion_name, self._emotion_moves))
+            logger.debug("Auto-emotion played (post-turn): %s", emotion_name)
+        except Exception as e:
+            logger.debug("Auto-emotion skipped: %s", e)
 
     def copy(self) -> GeminiLiveHandler:
         """Create a copy of the handler (required by fastrtc for Gradio mode)."""
@@ -349,11 +377,97 @@ class GeminiLiveHandler(AsyncStreamHandler):
             self._reconnect_requested = False
             logger.info("Gemini Live session connected")
 
+            # Start daemon health monitor (病根 2: detect Zenoh corruption)
+            health_task = asyncio.create_task(self._daemon_health_monitor())
+
             try:
                 await self._receive_loop()
             finally:
+                health_task.cancel()
                 self.session = None
                 self._connected_event.clear()
+
+    # ------------------------------------------------------------------ #
+    #  Daemon health monitor (病根 2: Zenoh corruption recovery)
+    # ------------------------------------------------------------------ #
+    async def _daemon_health_monitor(self) -> None:
+        """Periodically check robot daemon health via Zenoh SDK.
+
+        When Zenoh is corrupted (ready=False, last_alive=None), the audio
+        pipeline silently degrades. This monitor detects the bad state and
+        triggers a graceful self-restart so the daemon restarts the app
+        with a fresh Zenoh session.
+        """
+        HEALTH_CHECK_INTERVAL = 60.0  # seconds between checks
+        UNHEALTHY_THRESHOLD = 120.0   # seconds before triggering restart
+        unhealthy_since: float = 0.0
+
+        await asyncio.sleep(15.0)  # let startup settle
+
+        while not self._shutdown_requested:
+            try:
+                # SDK call goes through Zenoh — if Zenoh is broken, this times out
+                loop = asyncio.get_event_loop()
+                status = await asyncio.wait_for(
+                    loop.run_in_executor(None, self.deps.reachy_mini.client.get_status),
+                    timeout=10.0,
+                )
+                # Check for degraded state
+                import time as _time_hm
+                if not status or status.get("ready") is False:
+                    if unhealthy_since == 0:
+                        unhealthy_since = _time_hm.monotonic()
+                        logger.warning("Daemon health: DEGRADED (ready=%s)", status.get("ready"))
+                    elif _time_hm.monotonic() - unhealthy_since > UNHEALTHY_THRESHOLD:
+                        logger.error(
+                            "Daemon health: UNHEALTHY for >%.0fs — Zenoh likely corrupted. "
+                            "Triggering graceful exit for daemon auto-restart.",
+                            UNHEALTHY_THRESHOLD,
+                        )
+                        # Attempt daemon restart via HTTP API before exiting
+                        await self._attempt_daemon_restart()
+                        # Exit the process — daemon will auto-restart with fresh Zenoh
+                        self._shutdown_requested = True
+                        return
+                else:
+                    if unhealthy_since > 0:
+                        logger.info("Daemon health: recovered")
+                    unhealthy_since = 0
+
+            except asyncio.TimeoutError:
+                import time as _time_hm
+                if unhealthy_since == 0:
+                    unhealthy_since = _time_hm.monotonic()
+                    logger.warning("Daemon health: Zenoh get_status timeout (10s)")
+                elif _time_hm.monotonic() - unhealthy_since > UNHEALTHY_THRESHOLD:
+                    logger.error(
+                        "Daemon health: Zenoh unresponsive for >%.0fs — triggering restart.",
+                        UNHEALTHY_THRESHOLD,
+                    )
+                    await self._attempt_daemon_restart()
+                    self._shutdown_requested = True
+                    return
+
+            except Exception as e:
+                logger.debug("Daemon health check exception: %s", e)
+
+            await asyncio.sleep(HEALTH_CHECK_INTERVAL)
+
+    async def _attempt_daemon_restart(self) -> None:
+        """Try to restart the robot daemon via HTTP API."""
+        import urllib.request
+        robot_ip = os.environ.get("ROBOT_IP", "192.168.0.72")
+        base = f"http://{robot_ip}:8000/api"
+        for action, endpoint in [
+            ("stop app", f"{base}/apps/stop-current-app"),
+            ("stop daemon", f"{base}/daemon/stop"),
+        ]:
+            try:
+                req = urllib.request.Request(endpoint, method="POST")
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    logger.info("Daemon recovery: %s → %s", action, resp.status)
+            except Exception as e:
+                logger.warning("Daemon recovery: %s failed: %s", action, e)
 
     async def shutdown(self) -> None:
         """Shutdown the handler."""
@@ -502,20 +616,15 @@ class GeminiLiveHandler(AsyncStreamHandler):
                 await self.output_queue.put(
                     AdditionalOutputs({"role": "assistant", "content": text})
                 )
-                # Auto-emotion: play emotion based on what Vicky is saying
+                # Auto-emotion: detect emotion keyword but DEFER playback to turn_complete.
+                # Playing emotions during speech causes motor movement that can disrupt
+                # the audio pipeline (observed: "Cleared player queue" during playback).
                 if text and not self._emotion_played_this_turn:
                     emotion = self._classify_quick_emotion(text)
                     if emotion:
-                        try:
-                            from reachy_mini.motion.recorded_move import RecordedMoves
-                            from reachy_mini_conversation_app.dance_emotion_moves import EmotionQueueMove
-                            if not hasattr(self, '_emotion_moves'):
-                                self._emotion_moves = RecordedMoves("pollen-robotics/reachy-mini-emotions-library")
-                            self.deps.movement_manager.queue_move(EmotionQueueMove(emotion, self._emotion_moves))
-                            self._emotion_played_this_turn = True
-                            logger.debug("Auto-emotion: %s", emotion)
-                        except Exception as e:
-                            logger.debug("Auto-emotion skipped: %s", e)
+                        self._pending_auto_emotion = emotion
+                        self._emotion_played_this_turn = True
+                        logger.debug("Auto-emotion detected (deferred): %s", emotion)
 
         # Interruption (user started speaking while model was talking)
         if hasattr(sc, "interrupted") and sc.interrupted:
@@ -546,6 +655,14 @@ class GeminiLiveHandler(AsyncStreamHandler):
                 import time as _time_tc
                 self._last_gemini_audio_time = _time_tc.monotonic()  # reset so timeout counts from now
                 logger.info("Conversation mode: DORMANT -> ACTIVE")
+            # Play deferred auto-emotion AFTER turn completes (speech done).
+            # Delay 2.5s to let speaker finish playing buffered audio first.
+            if self._pending_auto_emotion:
+                _deferred_emotion = self._pending_auto_emotion
+                self._pending_auto_emotion = None
+                asyncio.get_event_loop().call_later(
+                    2.5, self._play_deferred_emotion, _deferred_emotion
+                )
             logger.debug("Gemini turn complete")
 
     # ------------------------------------------------------------------ #
@@ -788,8 +905,10 @@ class GeminiLiveHandler(AsyncStreamHandler):
             # Speech band energy ratio via FFT
             speech_ratio = -1.0
             is_speech_like = True  # default pass if SBER disabled
-            # Music playing: bypass SBER (music distorts ratio), only use RMS ≥ dormant threshold
-            _sber_threshold = (0.0 if self._music_playing
+            # Bypass SBER when music is playing OR during post-turn echo window.
+            # Speaker echo has SBER ≈ 0.35 which falsely blocks as "music".
+            _in_echo_window = (self._post_turn_echo_until > 0 and now < self._post_turn_echo_until)
+            _sber_threshold = (0.0 if (self._music_playing or _in_echo_window)
                                else SPEECH_BAND_RATIO_THRESHOLD)
             if _sber_threshold > 0 and len(audio_f32) >= 256:
                 fft = np.fft.rfft(audio_f32)
