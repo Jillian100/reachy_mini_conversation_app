@@ -39,12 +39,41 @@ from reachy_mini_conversation_app.tools.core_tools import (
 
 logger = logging.getLogger(__name__)
 
-# Debug: speech gate log to file (tail -f /tmp/speech_gate.log on robot)
-_gate_fh = logging.FileHandler("/tmp/speech_gate.log")
+# Debug: speech gate log to private file (was /tmp — moved 2026-04-10 per 007 audit).
+# /tmp is world-readable and stores tool call payloads; new path is 600.
+_gate_log_dir = os.path.expanduser("~/vicky_conversation/logs")
+try:
+    os.makedirs(_gate_log_dir, mode=0o700, exist_ok=True)
+except Exception:
+    pass
+_gate_log_path = os.path.join(_gate_log_dir, "speech_gate.log")
+_gate_fh = logging.FileHandler(_gate_log_path)
 _gate_fh.setLevel(logging.DEBUG)
 _gate_fh.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S"))
 logger.addHandler(_gate_fh)
 logger.setLevel(logging.DEBUG)
+try:
+    os.chmod(_gate_log_path, 0o600)
+except Exception:
+    pass
+
+# ── Vicky Voice Memory L1: crash-safe JSONL transcript hot log ──
+# Minimal-invasion hook into metis_extensions/voice_memory/transcript_writer.py.
+# Fails silent if module missing (e.g. on upstream merge without extensions).
+try:
+    import sys as _sys_tw
+    _sys_tw.path.insert(
+        0, os.path.expanduser("~/vicky_conversation/metis_extensions")
+    )
+    from voice_memory.transcript_writer import TranscriptWriter as _TW
+    _transcript_writer = _TW.instance()
+    logger.info(
+        "Voice Memory L1: transcript writer ready at %s (session=%s)",
+        _transcript_writer.log_dir, _transcript_writer.session_id,
+    )
+except Exception as _tw_err:
+    _transcript_writer = None
+    logger.warning("Voice Memory L1 disabled: %s", _tw_err)
 
 # Gemini Live API audio parameters
 GEMINI_INPUT_SAMPLE_RATE: Final[int] = 16000
@@ -600,6 +629,9 @@ class GeminiLiveHandler(AsyncStreamHandler):
 
     async def _handle_server_content(self, sc: Any) -> None:
         """Process Gemini server_content for transcription and interruption."""
+        _profile = os.environ.get("REACHY_MINI_CUSTOM_PROFILE", "default")
+        _mode = self._conversation_mode
+
         # Input transcription (user speech → text) — new user turn resets emotion flag
         if hasattr(sc, "input_transcription") and sc.input_transcription:
             text = getattr(sc.input_transcription, "text", None)
@@ -608,6 +640,13 @@ class GeminiLiveHandler(AsyncStreamHandler):
                 await self.output_queue.put(
                     AdditionalOutputs({"role": "user", "content": text})
                 )
+                if _transcript_writer is not None:
+                    try:
+                        _transcript_writer.write_turn(
+                            "user", text, profile=_profile, conv_mode=_mode
+                        )
+                    except Exception as e:
+                        logger.debug("transcript write (user) failed: %s", e)
 
         # Output transcription (model speech → text)
         if hasattr(sc, "output_transcription") and sc.output_transcription:
@@ -616,6 +655,13 @@ class GeminiLiveHandler(AsyncStreamHandler):
                 await self.output_queue.put(
                     AdditionalOutputs({"role": "assistant", "content": text})
                 )
+                if _transcript_writer is not None:
+                    try:
+                        _transcript_writer.write_turn(
+                            "assistant", text, profile=_profile, conv_mode=_mode
+                        )
+                    except Exception as e:
+                        logger.debug("transcript write (assistant) failed: %s", e)
                 # Auto-emotion: detect emotion keyword but DEFER playback to turn_complete.
                 # Playing emotions during speech causes motor movement that can disrupt
                 # the audio pipeline (observed: "Cleared player queue" during playback).
@@ -774,6 +820,20 @@ class GeminiLiveHandler(AsyncStreamHandler):
                 except asyncio.CancelledError:
                     pass
 
+            # Persist tool call to voice memory L1 (JSONL hot log)
+            if _transcript_writer is not None:
+                try:
+                    _transcript_writer.write_turn(
+                        "tool",
+                        json.dumps({"name": tool_name, "args": args_dict, "result": tool_result},
+                                    ensure_ascii=False),
+                        tool_calls=[{"name": tool_name, "args": args_dict, "result": tool_result}],
+                        profile=os.environ.get("REACHY_MINI_CUSTOM_PROFILE", "default"),
+                        conv_mode=self._conversation_mode,
+                    )
+                except Exception as _e:
+                    logger.debug("transcript write (tool) failed: %s", _e)
+
             # Emit tool result to chatbot UI
             await self.output_queue.put(
                 AdditionalOutputs({
@@ -905,11 +965,17 @@ class GeminiLiveHandler(AsyncStreamHandler):
             # Speech band energy ratio via FFT
             speech_ratio = -1.0
             is_speech_like = True  # default pass if SBER disabled
-            # Bypass SBER when music is playing OR during post-turn echo window.
-            # Speaker echo has SBER ≈ 0.35 which falsely blocks as "music".
+            # Lower SBER threshold during post-turn echo window.
+            # Speaker echo has SBER ≈ 0.35 — fully bypassing SBER (0.0) causes echo
+            # feedback loops. Lowering to 0.40 blocks pure echo while letting through
+            # real speech (SBER ≥ 0.5) or speech mixed with residual echo (SBER ~0.4-0.5).
             _in_echo_window = (self._post_turn_echo_until > 0 and now < self._post_turn_echo_until)
-            _sber_threshold = (0.0 if (self._music_playing or _in_echo_window)
-                               else SPEECH_BAND_RATIO_THRESHOLD)
+            if self._music_playing:
+                _sber_threshold = 0.0
+            elif _in_echo_window:
+                _sber_threshold = 0.40
+            else:
+                _sber_threshold = SPEECH_BAND_RATIO_THRESHOLD
             if _sber_threshold > 0 and len(audio_f32) >= 256:
                 fft = np.fft.rfft(audio_f32)
                 power = np.abs(fft) ** 2
@@ -919,10 +985,12 @@ class GeminiLiveHandler(AsyncStreamHandler):
                 speech_ratio = float(np.sum(power[speech_mask])) / total_power
                 is_speech_like = speech_ratio >= _sber_threshold
 
-            # Dynamic threshold based on conversation mode
-            _effective_threshold = (ENERGY_GATE_DORMANT
-                                   if self._conversation_mode == "dormant"
-                                   else ENERGY_GATE_THRESHOLD)
+            # Dynamic threshold based on conversation mode.
+            # During echo window, force dormant threshold to filter speaker echo.
+            if self._conversation_mode == "dormant" or _in_echo_window:
+                _effective_threshold = ENERGY_GATE_DORMANT
+            else:
+                _effective_threshold = ENERGY_GATE_THRESHOLD
 
             if rms >= _effective_threshold and is_speech_like:
                 # Speech detected (loud enough + right spectral shape)
